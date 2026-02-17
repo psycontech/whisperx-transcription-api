@@ -1,0 +1,7 @@
+.venv
+test_data
+.vscode
+previous_work/
+__pycache__/
+uploads/
+.DS_Store
