@@ -90,6 +90,7 @@ sentencepiece==0.2.1
 setuptools==82.0.0
 shellingham==1.5.4
 six==1.17.0
+slowapi==0.1.9
 sortedcontainers==2.4.0
 soundfile==0.13.1
 speechbrain==1.0.3
@@ -111,5 +112,5 @@ typer-slim==0.23.1
 typing_extensions==4.15.0
 urllib3==2.6.3
 uvicorn==0.41.0
-whisperx==3.3.1
+# whisperx==3.3.1
 yarl==1.22.0

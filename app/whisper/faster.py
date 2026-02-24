@@ -9,7 +9,7 @@ from pyannote.audio import Pipeline # type: ignore
 
 device = "cpu"
 audio_file = "test_data/data.mp3"
-HF_TOKEN = "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"
+HF_TOKEN = "..."
 
 
 # 1. Transcribe with word timestamps

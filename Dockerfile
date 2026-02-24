@@ -30,7 +30,7 @@ COPY requirements_prod.txt  .
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps -r requirements_prod.txt
+    pip install -r requirements_prod.txt
 
 COPY . .
 

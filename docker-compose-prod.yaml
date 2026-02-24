@@ -1,0 +1,17 @@
+services:
+  whisper:
+    build: .
+    
+    ports:
+      - "${PORT}:${PORT}"
+
+    container_name: whisper
+  
+    restart: unless-stopped
+
+    environment:
+      - PYTHON_ENV=production
+      - HF_TOKEN=${HF_TOKEN}
+      - PORT=${PORT}
+      - PYTHONUNBUFFERED=1
+    
