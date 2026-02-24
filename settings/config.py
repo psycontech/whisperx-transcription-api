@@ -41,7 +41,7 @@ class GlobalConfig(BaseSettings):
 
     ENVIRONMENT: EnvironmentType = PYTHON_ENV
 
-    HF_TOKEN: str = Field("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")
+    HF_TOKEN: str = Field(..., env="HF_TOKEN") # type: ignore
 
     WHISPER_MODEL_SIZE: str = Field("small", env="WHISPER_MODEL_SIZE") # type: ignore
     WHISPER_MODEL_DEVICE: str = Field("cpu", env="WHISPER_MODEL_DEVICE") # type: ignore
@@ -57,8 +57,6 @@ class GlobalConfig(BaseSettings):
 class DevelopmentConfig(GlobalConfig):
     """Development environment specific configurations."""
     DEBUG: bool = True
- 
-
 
 class ProductionConfig(GlobalConfig):
     """Production environment specific configurations."""

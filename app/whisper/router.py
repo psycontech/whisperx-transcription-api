@@ -11,8 +11,8 @@ router = VersionRouter(version="1", path="whisper", tags=["Whisper"])
 
 @router.post("/", status_code=HttpStatus.HTTP_200_OK, response_model=HttpResponse[ProcessAudioResponseSchema])
 async def process_audio(
+    process_audio_schema: ProcessAudioSchema,
     whisper_service: Annotated[WhisperService, Depends(WhisperService)], 
-    process_audio_schema: Annotated[ProcessAudioSchema, Depends(ProcessAudioSchema)]
 ) -> HttpResponse[ProcessAudioResponseSchema]:
 
     results = await whisper_service.process_audio(process_audio_schema)

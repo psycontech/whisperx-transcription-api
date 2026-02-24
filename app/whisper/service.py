@@ -1,11 +1,11 @@
 from fastapi import Depends
-from typing import Any, Annotated, Optional, Tuple
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
 from settings.config import SettingsDep
 from faster_whisper import WhisperModel # type: ignore
 from faster_whisper.transcribe import TranscriptionInfo # type: ignore
 from app.file.service import FileService
+from typing import Any, Annotated, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
@@ -18,7 +18,7 @@ class WhisperService:
         self.process_pool_executor = ProcessPoolExecutor(max_workers=4)
 
     async def process_audio(self, process_audio_schema: ProcessAudioSchema) -> ProcessAudioResponseSchema:
-        file = await self.file_service.upload_file(process_audio_schema.file)
+        file = await self.file_service.download_file(str(process_audio_schema.audio_file_url))
 
         loop = get_event_loop()
 
@@ -35,7 +35,6 @@ class WhisperService:
         speaker_set = set()
 
         for turn in results:
-            print(turn["speaker"])
             speaker_set.add(turn["speaker"])
 
         processed_audio_response_schema = ProcessAudioResponseSchema(
@@ -56,6 +55,8 @@ class WhisperService:
                 ) for turn in results
             ]
         )
+    
+        await self.file_service.delete_file(file)
 
         return processed_audio_response_schema
     

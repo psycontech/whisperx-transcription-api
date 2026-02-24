@@ -5,3 +5,4 @@ previous_work/
 __pycache__/
 uploads/
 .DS_Store
+.env

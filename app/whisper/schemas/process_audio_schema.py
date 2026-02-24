@@ -1,9 +1,6 @@
 from typing import Optional
-from fastapi import UploadFile, Form
-from dataclasses import dataclass
-from pydantic import PositiveInt
+from pydantic import PositiveInt, BaseModel, HttpUrl
 
-@dataclass
-class ProcessAudioSchema:
-    file: UploadFile
-    num_of_speakers: Optional[PositiveInt] = Form(None)
+class ProcessAudioSchema(BaseModel):
+    num_of_speakers: Optional[PositiveInt] = None
+    audio_file_url: HttpUrl

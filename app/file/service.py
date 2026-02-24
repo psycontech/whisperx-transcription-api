@@ -2,6 +2,7 @@ import os
 import aiofiles
 from uuid import uuid4
 from fastapi import UploadFile
+import httpx
 from .schemas.file_schema import File
 from settings.config import SettingsDep
 
@@ -33,5 +34,30 @@ class FileService:
         # Delete physical file after database operation
         if os.path.exists(file_path):
             os.remove(file_path)
+
+    async def download_file(self, url: str) -> File:
+
+        key = str(uuid4())
+
+        if not os.path.exists(self.settings.UPLOAD_DIR):
+            os.mkdir(self.settings.UPLOAD_DIR)
+
+        new_file_path = self.settings.UPLOAD_DIR / key
+    
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+
+
+                content_type = response.headers.get("content-type", "application/octet-stream")
+                content_length = response.headers.get("content-length")
+                
+                with open(new_file_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+
+        new_file = File(name=key, path=str(new_file_path), content_type=content_type, size=content_length)
+
+        return new_file
 
         
