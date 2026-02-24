@@ -2,3 +2,6 @@
 .devcontainer
 .vscode
 mypy.ini
+.env
+uploads
+test_data
