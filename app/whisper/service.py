@@ -29,7 +29,9 @@ class WhisperService:
             self.settings.WHISPER_MODEL_SIZE,
             self.settings.WHISPER_MODEL_DEVICE,
             self.settings.WHISPER_COMPUTE_TYPE,
-            self.settings.HF_TOKEN
+            self.settings.HF_TOKEN,
+            process_audio_schema.num_of_speakers,
+            process_audio_schema.language,
         )
 
         speaker_set = set()
@@ -61,7 +63,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -76,7 +78,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     )
 
     print("Transcribing...")
-    segments, info = whisper_model.transcribe(file_path, beam_size=1, word_timestamps=True)
+    segments, info = whisper_model.transcribe(file_path, beam_size=1, word_timestamps=True, language=language)
 
 
     print("Loading diarization model...")
