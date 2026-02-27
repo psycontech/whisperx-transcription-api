@@ -36,28 +36,33 @@ class FileService:
             os.remove(file_path)
 
     async def download_file(self, url: str) -> File:
+        import mimetypes
+        from urllib.parse import urlparse
 
         key = str(uuid4())
 
         if not os.path.exists(self.settings.UPLOAD_DIR):
             os.mkdir(self.settings.UPLOAD_DIR)
 
-        new_file_path = self.settings.UPLOAD_DIR / key
-    
         async with httpx.AsyncClient() as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
 
-
                 content_type = response.headers.get("content-type", "application/octet-stream")
                 content_length = response.headers.get("content-length")
-                
+
+                # Try to get extension from URL first, fallback to content-type
+                url_path = urlparse(url).path
+                ext = os.path.splitext(url_path)[1]  # e.g. ".mp3", ".wav"
+                if not ext:
+                    ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+
+                new_file_path = self.settings.UPLOAD_DIR / f"{key}{ext}"
+
                 with open(new_file_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size=8192):
                         f.write(chunk)
 
-        new_file = File(name=key, path=str(new_file_path), content_type=content_type, size=content_length)
+        new_file = File(name=f"{key}{ext}", path=str(new_file_path), content_type=content_type, size=content_length)
 
         return new_file
-
-        

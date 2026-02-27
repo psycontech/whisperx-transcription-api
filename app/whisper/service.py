@@ -1,3 +1,5 @@
+import torch
+import torchaudio # type: ignore
 from fastapi import Depends
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
@@ -102,6 +104,18 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     return speaker_turns, info
 
 
+def pad_audio(audio_file_path: str) -> dict:
+    waveform, sample_rate = torchaudio.load(str(audio_file_path))
+
+    chunk_size = 160000
+    remainder = waveform.shape[-1] % chunk_size
+    if remainder != 0:
+        pad_size = chunk_size - remainder
+        waveform = torch.nn.functional.pad(waveform, (0, pad_size))
+
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
 def assign_word_speakers(audio_file_path: str, transcription_segments, diarization_pipeline: Pipeline, num_of_speakers: Optional[int] = None):
     print("Diarizing audio...")
     diarization_kwargs = {}
@@ -110,7 +124,11 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
         diarization_kwargs["min_speakers"] = num_of_speakers
         diarization_kwargs["max_speakers"] = num_of_speakers
 
-    diarization = diarization_pipeline(audio_file_path, **diarization_kwargs)
+    
+    # Pad audio file with empty audio after chunk split
+    audio_input = pad_audio(audio_file_path)
+
+    diarization = diarization_pipeline(audio_input, **diarization_kwargs)
     words_with_speakers = []
     
     for segment in transcription_segments:
