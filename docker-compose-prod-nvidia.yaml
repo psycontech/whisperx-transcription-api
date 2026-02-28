@@ -1,0 +1,30 @@
+services:
+  whisper:
+    build: 
+      context: .
+      dockerfile: Dockerfile-nvidia
+    
+    ports:
+      - "${PORT}:${PORT}"
+
+    container_name: whisper_cuda
+  
+    restart: unless-stopped
+
+    environment:
+      - PYTHON_ENV=production
+      - HF_TOKEN=${HF_TOKEN}
+      - PORT=${PORT}
+      - PYTHONUNBUFFERED=1
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE}
+      - WHISPER_MODEL_DEVICE=${WHISPER_MODEL_DEVICE}
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
