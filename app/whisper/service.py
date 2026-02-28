@@ -1,6 +1,7 @@
 import torch
 import torchaudio # type: ignore
 from fastapi import Depends
+from datetime import datetime, timezone
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
 from settings.config import SettingsDep
@@ -24,6 +25,8 @@ class WhisperService:
 
         loop = get_event_loop()
 
+        processing_time_start = datetime.now(timezone.utc)
+
         results, transcription_info = await loop.run_in_executor(
             self.process_pool_executor,
             transcribe_audio,
@@ -41,6 +44,9 @@ class WhisperService:
         for turn in results:
             speaker_set.add(turn["speaker"])
 
+
+        processing_time_end = datetime.now(timezone.utc)
+
         processed_audio_response_schema = ProcessAudioResponseSchema(
             num_of_speakers=len(speaker_set),
             detected_language=transcription_info.language,
@@ -57,7 +63,10 @@ class WhisperService:
                     processed_start= round(turn["start"], 2),
                     processed_end=round(turn["end"], 2)
                 ) for turn in results
-            ]
+            ],
+            processing_time_start=processing_time_start,
+            processing_time_end=processing_time_end,
+            processing_duration_in_seconds= (processing_time_end - processing_time_start).total_seconds()
         )
     
         await self.file_service.delete_file(file)
@@ -88,6 +97,12 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
         "pyannote/speaker-diarization-3.1",
         use_auth_token=hf_token
     )
+
+    if torch.cuda.is_available():
+        print("CUDA IS AVAILABLE")
+        diarization_pipeline.to(torch.device("cuda"))
+    else:
+        print("CUDA NOT AVAILABLE, USING CPU for Diarization")
 
     result_segments = []
     for segment in segments:

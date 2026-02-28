@@ -1,4 +1,5 @@
-from typing import List
+from typing import List, Optional
+from datetime import datetime
 from pydantic import BaseModel, PositiveFloat
 
 class SpeakerTurn(BaseModel):
@@ -17,3 +18,6 @@ class ProcessAudioResponseSchema(BaseModel):
     language_probability: PositiveFloat
     audio_duration_seconds: PositiveFloat
     turns: List[SpeakerTurn]
+    processing_time_start: Optional[datetime] = None
+    processing_time_end: Optional[datetime] = None
+    processing_duration_in_seconds: Optional[PositiveFloat] = None

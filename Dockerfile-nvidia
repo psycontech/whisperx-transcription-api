@@ -1,4 +1,4 @@
-FROM python:3.12 AS builder
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 # Set build arguments and environment variables
 ARG DEBIAN_FRONTEND=noninteractive
@@ -6,31 +6,36 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_DEFAULT_TIMEOUT=100
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
 # Install system build dependencies
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt update \
+    && apt install -y software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt update \
+    && apt install -y python3.12 \
     build-essential \
     curl \
     pkg-config \
     libpq-dev \
-    cmake\
+    cmake \
+    python3-pip \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Set working directory
 WORKDIR /app
 
-
-RUN pip install --no-cache-dir --no-deps torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir --no-deps torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
 
 # Copy dependency files
 COPY requirements_prod.txt  .
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements_prod.txt
+    pip install --ignore-installed -r requirements_prod.txt
 
 COPY . .
 
