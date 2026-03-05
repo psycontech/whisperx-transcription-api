@@ -158,8 +158,8 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
                 overlap_start = max(word.start, turn.start)
                 overlap_end = min(word.end, turn.end)
                 overlap = max(0, overlap_end - overlap_start)
-                
-                if overlap > max_overlap:
+
+                if overlap > max_overlap and overlap >= 0.05:
                     max_overlap = overlap
                     assigned_speaker = speaker
             
