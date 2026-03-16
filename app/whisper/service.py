@@ -13,12 +13,36 @@ from concurrent.futures import ProcessPoolExecutor
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
 
+process_pool_executor = ProcessPoolExecutor(max_workers=4)
+
+_whisper_model: Optional[WhisperModel] = None
+_diarization_pipeline: Optional[Pipeline] = None
+
+def get_whisper_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        print("Loading Whisper model...")
+        _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    return _whisper_model
+
+def get_diarization_pipeline(hf_token: str) -> Pipeline:
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        print("Loading diarization pipeline...")
+        _diarization_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token
+        )
+        if torch.cuda.is_available():
+
+            _diarization_pipeline.to(torch.device("cuda"))
+    return _diarization_pipeline
 
 class WhisperService:
     def __init__(self, settings: SettingsDep, file_service: Annotated[FileService, Depends(FileService)]):
         self.settings = settings
         self.file_service = file_service
-        self.process_pool_executor = ProcessPoolExecutor(max_workers=4)
+        self.process_pool_executor = process_pool_executor
 
     async def process_audio(self, process_audio_schema: ProcessAudioSchema) -> ProcessAudioResponseSchema:
         file = await self.file_service.download_file(str(process_audio_schema.audio_file_url))
@@ -82,27 +106,22 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    whisper_model = WhisperModel(
-        model_size, 
-        device=device, 
-        compute_type=compute_type
-    )
+
+    whisper_model = get_whisper_model(model_size, device, compute_type)
 
     print("Transcribing...")
     segments, info = whisper_model.transcribe(file_path, beam_size=1, word_timestamps=True, language=language)
 
-
     print("Loading diarization model...")
-    diarization_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token
-    )
+
 
     if torch.cuda.is_available():
         print("CUDA IS AVAILABLE")
-        diarization_pipeline.to(torch.device("cuda"))
     else:
         print("CUDA NOT AVAILABLE, USING CPU for Diarization")
+   
+    diarization_pipeline = get_diarization_pipeline(hf_token)
+
 
     result_segments = []
     for segment in segments:
