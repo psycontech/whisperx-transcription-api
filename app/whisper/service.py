@@ -1,48 +1,54 @@
 import torch
 import torchaudio # type: ignore
+import threading
 from fastapi import Depends
-from datetime import datetime, timezone
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
+from datetime import datetime, timezone
 from settings.config import SettingsDep
 from faster_whisper import WhisperModel # type: ignore
-from faster_whisper.transcribe import TranscriptionInfo # type: ignore
 from app.file.service import FileService
 from typing import Any, Annotated, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor
+from faster_whisper.transcribe import TranscriptionInfo # type: ignore
+from concurrent.futures import ThreadPoolExecutor
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
 
-process_pool_executor = ProcessPoolExecutor(max_workers=4)
+thread_pool_executor = ThreadPoolExecutor(max_workers=4)
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
 
+whisper_model_lock = threading.Lock()
+diarization_pipeline_lock = threading.Lock()
+
 def get_whisper_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
     global _whisper_model
-    if _whisper_model is None:
-        print("Loading Whisper model...")
-        _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    with whisper_model_lock:
+        if _whisper_model is None:
+            print("Loading Whisper model...")
+            _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     return _whisper_model
 
 def get_diarization_pipeline(hf_token: str) -> Pipeline:
     global _diarization_pipeline
-    if _diarization_pipeline is None:
-        print("Loading diarization pipeline...")
-        _diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
-        )
-        if torch.cuda.is_available():
+    with diarization_pipeline_lock:
+        if _diarization_pipeline is None:
+            print("Loading diarization pipeline...")
+            _diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+            if torch.cuda.is_available():
 
-            _diarization_pipeline.to(torch.device("cuda"))
+                _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
 
 class WhisperService:
     def __init__(self, settings: SettingsDep, file_service: Annotated[FileService, Depends(FileService)]):
         self.settings = settings
         self.file_service = file_service
-        self.process_pool_executor = process_pool_executor
+        self.thread_pool_executor = thread_pool_executor
 
     async def process_audio(self, process_audio_schema: ProcessAudioSchema) -> ProcessAudioResponseSchema:
         file = await self.file_service.download_file(str(process_audio_schema.audio_file_url))
@@ -52,7 +58,7 @@ class WhisperService:
         processing_time_start = datetime.now(timezone.utc)
 
         results, transcription_info = await loop.run_in_executor(
-            self.process_pool_executor,
+            self.thread_pool_executor,
             transcribe_audio,
             file.path,
             self.settings.WHISPER_MODEL_SIZE,
