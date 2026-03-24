@@ -179,15 +179,30 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
             assigned_speaker = None
             max_overlap = 0
             
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
+            diarization_tracks = list(diarization.itertracks(yield_label=True))
+
+            for turn, _, speaker in diarization_tracks:
                 overlap_start = max(word.start, turn.start)
                 overlap_end = min(word.end, turn.end)
                 overlap = max(0, overlap_end - overlap_start)
 
-                if overlap > max_overlap and overlap >= 0.05:
+                if overlap > max_overlap:
                     max_overlap = overlap
                     assigned_speaker = speaker
-            
+
+            if assigned_speaker is None:
+                word_mid = (word.start + word.end) / 2
+                min_distance = float('inf')
+                for turn, _, speaker in diarization_tracks:
+                    turn_mid = (turn.start + turn.end) / 2
+                    distance = abs(word_mid - turn_mid)
+                    if distance < min_distance:
+                        min_distance = distance
+                        assigned_speaker = speaker
+
+            if assigned_speaker is None:
+                print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
+
             words_with_speakers.append({
                 'word': word.word,
                 'start': word.start,
@@ -203,7 +218,10 @@ def group_by_speaker_turns(words_with_speakers: list[Any]):
         return []
     
     valid_words = [w for w in words_with_speakers if w['speaker'] is not None]
-    
+    dropped = len(words_with_speakers) - len(valid_words)
+    if dropped > 0:
+        print(f"WARNING: {dropped} word(s) dropped due to no speaker assignment")
+
     if not valid_words:
         return []
     

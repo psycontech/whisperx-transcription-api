@@ -35,8 +35,25 @@ class FileService:
         if os.path.exists(file_path):
             os.remove(file_path)
 
+    _AUDIO_MIME_EXTENSIONS = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/wave": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/ogg": ".ogg",
+        "audio/flac": ".flac",
+        "audio/x-flac": ".flac",
+        "audio/mp4": ".mp4",
+        "audio/m4a": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/webm": ".webm",
+        "audio/aac": ".aac",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+    }
+
     async def download_file(self, url: str) -> File:
-        import mimetypes
         from urllib.parse import urlparse
 
         key = str(uuid4())
@@ -51,11 +68,23 @@ class FileService:
                 content_type = response.headers.get("content-type", "application/octet-stream")
                 content_length = response.headers.get("content-length")
 
-                # Try to get extension from URL first, fallback to content-type
+                # Try URL extension first, then content-type map, then Content-Disposition
                 url_path = urlparse(url).path
-                ext = os.path.splitext(url_path)[1]  # e.g. ".mp3", ".wav"
-                if not ext:
-                    ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+                ext = os.path.splitext(url_path)[1].lower()
+
+                if not ext or ext == ".bin":
+                    mime = content_type.split(";")[0].strip().lower()
+                    ext = self._AUDIO_MIME_EXTENSIONS.get(mime, "")
+
+                if not ext or ext == ".bin":
+                    disposition = response.headers.get("content-disposition", "")
+                    if "filename=" in disposition:
+                        fname = disposition.split("filename=")[-1].strip().strip('"')
+                        ext = os.path.splitext(fname)[1].lower()
+
+                if not ext or ext == ".bin":
+                    print(f"WARNING: Could not determine audio format for content-type '{content_type}', defaulting to .mp3")
+                    ext = ".mp3"
 
                 new_file_path = self.settings.UPLOAD_DIR / f"{key}{ext}"
 
