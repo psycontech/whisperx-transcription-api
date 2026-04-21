@@ -116,7 +116,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     whisper_model = get_whisper_model(model_size, device, compute_type)
 
     print("Transcribing...")
-    segments, info = whisper_model.transcribe(file_path, beam_size=1, word_timestamps=True, language=language)
+    segments, info = whisper_model.transcribe(file_path, beam_size=5, word_timestamps=True, language=language)
 
     print("Loading diarization model...")
 
