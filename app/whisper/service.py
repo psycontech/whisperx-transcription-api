@@ -30,7 +30,7 @@ def get_whisper_model(model_size: str, device: str, compute_type: str) -> Whispe
             _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     return _whisper_model
 
-def get_diarization_pipeline(hf_token: str) -> Pipeline:
+def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Pipeline:
     global _diarization_pipeline
     with diarization_pipeline_lock:
         if _diarization_pipeline is None:
@@ -39,8 +39,17 @@ def get_diarization_pipeline(hf_token: str) -> Pipeline:
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=hf_token
             )
+            _diarization_pipeline.instantiate({
+                "segmentation": {
+                    "min_duration_off": min_duration_off,
+                },
+                "clustering": {
+                    "threshold": clustering_threshold,
+                    "method": "centroid",
+                    "min_cluster_size": min_cluster_size,
+                }
+            })
             if torch.cuda.is_available():
-
                 _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
 
@@ -67,6 +76,9 @@ class WhisperService:
             self.settings.HF_TOKEN,
             process_audio_schema.num_of_speakers,
             process_audio_schema.language,
+            self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
+            self.settings.DIARIZATION_MIN_DURATION_OFF,
+            self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
         )
 
         speaker_set = set()
@@ -104,7 +116,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -126,7 +138,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     else:
         print("CUDA NOT AVAILABLE, USING CPU for Diarization")
    
-    diarization_pipeline = get_diarization_pipeline(hf_token)
+    diarization_pipeline = get_diarization_pipeline(hf_token, clustering_threshold, min_duration_off, min_cluster_size)
 
 
     result_segments = []
