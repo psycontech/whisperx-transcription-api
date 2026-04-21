@@ -127,6 +127,19 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     whisper_model = get_whisper_model(model_size, device, compute_type)
 
+    print("=" * 50)
+    print("TRANSCRIPTION CONFIG")
+    print("  beam_size:                    5")
+    print(f"  model_size:                   {model_size}")
+    print(f"  compute_type:                 {compute_type}")
+    print(f"  device:                       {device}")
+    print(f"  language:                     {language or 'auto-detect'}")
+    print(f"  num_of_speakers:              {num_of_speakers or 'auto'}")
+    print(f"  clustering_threshold:         {clustering_threshold}")
+    print(f"  min_duration_off:             {min_duration_off}")
+    print(f"  min_cluster_size:             {min_cluster_size}")
+    print("=" * 50)
+
     print("Transcribing...")
     segments, info = whisper_model.transcribe(file_path, beam_size=5, word_timestamps=True, language=language)
 
