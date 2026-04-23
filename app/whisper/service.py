@@ -141,7 +141,15 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     print("=" * 50)
 
     print("Transcribing...")
-    segments, info = whisper_model.transcribe(file_path, beam_size=5, word_timestamps=True, language=language)
+    segments, info = whisper_model.transcribe(
+        file_path, 
+        beam_size=5, 
+        word_timestamps=True, 
+        language=language, 
+        no_speech_threshold=0.3, 
+        suppress_tokens=[], 
+        condition_on_previous_text=True
+    )
 
     print("Loading diarization model...")
 
