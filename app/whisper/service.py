@@ -147,7 +147,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
         word_timestamps=True, 
         language=language, 
         no_speech_threshold=0.3, 
-        suppress_tokens=[], 
+        suppress_tokens=[-1], 
         condition_on_previous_text=True
     )
 
