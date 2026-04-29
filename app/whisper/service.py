@@ -79,6 +79,11 @@ class WhisperService:
             self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
             self.settings.DIARIZATION_MIN_DURATION_OFF,
             self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
+            process_audio_schema.beam_size,
+            process_audio_schema.no_speech_threshold,
+            process_audio_schema.initial_prompt,
+            process_audio_schema.vad_filter,
+            process_audio_schema.hallucination_silence_threshold,
         )
 
         speaker_set = set()
@@ -116,7 +121,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -127,14 +132,24 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     whisper_model = get_whisper_model(model_size, device, compute_type)
 
+    _beam_size = beam_size if beam_size is not None else 7
+    _no_speech_threshold = no_speech_threshold if no_speech_threshold is not None else 0.3
+    _initial_prompt = initial_prompt
+    _vad_filter = vad_filter if vad_filter is not None else False
+    _hallucination_silence_threshold = hallucination_silence_threshold
+
     print("=" * 50)
     print("TRANSCRIPTION CONFIG")
-    print("  beam_size:                    5")
+    print(f"  beam_size:                    {_beam_size}")
     print(f"  model_size:                   {model_size}")
     print(f"  compute_type:                 {compute_type}")
     print(f"  device:                       {device}")
     print(f"  language:                     {language or 'auto-detect'}")
     print(f"  num_of_speakers:              {num_of_speakers or 'auto'}")
+    print(f"  no_speech_threshold:          {_no_speech_threshold}")
+    print(f"  initial_prompt:               {_initial_prompt or 'none'}")
+    print(f"  vad_filter:                   {_vad_filter}")
+    print(f"  hallucination_silence_threshold: {_hallucination_silence_threshold or 'none'}")
     print(f"  clustering_threshold:         {clustering_threshold}")
     print(f"  min_duration_off:             {min_duration_off}")
     print(f"  min_cluster_size:             {min_cluster_size}")
@@ -142,13 +157,16 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     print("Transcribing...")
     segments, info = whisper_model.transcribe(
-        file_path, 
-        beam_size=5, 
-        word_timestamps=True, 
-        language=language, 
-        no_speech_threshold=0.3, 
-        suppress_tokens=[-1], 
-        condition_on_previous_text=True
+        file_path,
+        beam_size=_beam_size,
+        word_timestamps=True,
+        language=language,
+        no_speech_threshold=_no_speech_threshold,
+        initial_prompt=_initial_prompt,
+        vad_filter=_vad_filter,
+        hallucination_silence_threshold=_hallucination_silence_threshold,
+        suppress_tokens=[-1],
+        condition_on_previous_text=True,
     )
 
     print("Loading diarization model...")
