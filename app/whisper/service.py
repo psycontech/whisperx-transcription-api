@@ -132,7 +132,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     whisper_model = get_whisper_model(model_size, device, compute_type)
 
-    _beam_size = beam_size if beam_size is not None else 7
+    _beam_size = beam_size if beam_size is not None else 3
     _no_speech_threshold = no_speech_threshold if no_speech_threshold is not None else 0.3
     _initial_prompt = initial_prompt
     _vad_filter = vad_filter if vad_filter is not None else False
@@ -165,8 +165,8 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
         initial_prompt=_initial_prompt,
         vad_filter=_vad_filter,
         hallucination_silence_threshold=_hallucination_silence_threshold,
-        suppress_tokens=[-1],
-        condition_on_previous_text=True,
+        suppress_tokens=[],
+        condition_on_previous_text=False,
     )
 
     print("Loading diarization model...")
