@@ -10,3 +10,4 @@ class ProcessAudioSchema(BaseModel):
     initial_prompt: Optional[str] = Field(default=None, nullable=True)
     vad_filter: Optional[bool] = Field(default=None, nullable=True)
     hallucination_silence_threshold: Optional[float] = Field(default=None, nullable=True)
+    classify_events: Optional[bool] = Field(default=False, nullable=True)

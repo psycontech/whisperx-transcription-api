@@ -10,6 +10,7 @@ class SpeakerTurn(BaseModel):
     processed_start: float
     processed_end: float
     processed_speaker: int
+    audio_events: List[str] = []
 
 class ProcessAudioResponseSchema(BaseModel):
     num_of_speakers: int

@@ -11,6 +11,7 @@ from app.file.service import FileService
 from typing import Any, Annotated, Optional, Tuple
 from faster_whisper.transcribe import TranscriptionInfo # type: ignore
 from concurrent.futures import ThreadPoolExecutor
+from transformers import ASTFeatureExtractor, AutoModelForAudioClassification  # type: ignore
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
 
@@ -18,9 +19,21 @@ thread_pool_executor = ThreadPoolExecutor(max_workers=4)
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
+_ast_model = None
+_ast_feature_extractor = None
 
 whisper_model_lock = threading.Lock()
 diarization_pipeline_lock = threading.Lock()
+_ast_lock = threading.Lock()
+
+AST_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
+AST_CONFIDENCE_THRESHOLD = 0.1
+AST_TARGET_EVENTS = {
+    "Music", "Laughter", "Cough", "Silence", "Singing", "Speech",
+    "Male speech, man speaking", "Female speech, woman speaking",
+    "Child speech, kid speaking", "Conversation", "Narration, monologue",
+    "Background music", "Vocal music", "Sneeze", "Breathing", "Crying, sobbing",
+}
 
 def get_whisper_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
     global _whisper_model
@@ -29,6 +42,63 @@ def get_whisper_model(model_size: str, device: str, compute_type: str) -> Whispe
             print("Loading Whisper model...")
             _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     return _whisper_model
+
+def get_ast_model():
+    global _ast_model, _ast_feature_extractor
+    with _ast_lock:
+        if _ast_model is None:
+            print("Loading AST audio classification model...")
+            _ast_feature_extractor = ASTFeatureExtractor.from_pretrained(AST_MODEL_ID)
+            _ast_model = AutoModelForAudioClassification.from_pretrained(AST_MODEL_ID)
+            _ast_model.eval()
+            if torch.cuda.is_available():
+                _ast_model = _ast_model.to(torch.device("cuda"))
+    return _ast_model, _ast_feature_extractor
+
+
+def classify_audio_segment(audio_file_path: str, start: float, end: float) -> list[str]:
+    import numpy as np
+    TARGET_SR = 16000
+
+    waveform, sr = torchaudio.load(audio_file_path)
+    start_frame = max(0, int(start * sr))
+    end_frame = min(waveform.shape[-1], int(end * sr))
+
+    if end_frame <= start_frame:
+        return []
+
+    waveform = waveform[:, start_frame:end_frame]
+
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    if sr != TARGET_SR:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_SR)
+        waveform = resampler(waveform)
+
+    audio_np = waveform.squeeze(0).numpy().astype(np.float32)
+
+    if len(audio_np) < TARGET_SR * 0.1:
+        return []
+
+    model, feature_extractor = get_ast_model()
+    inputs = feature_extractor(audio_np, sampling_rate=TARGET_SR, return_tensors="pt")
+
+    if torch.cuda.is_available():
+        inputs = {k: v.to(torch.device("cuda")) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    probs = torch.sigmoid(outputs.logits).squeeze(0)
+    id2label = model.config.id2label
+
+    return [
+        id2label[idx]
+        for idx, score in enumerate(probs.tolist())
+        if score >= AST_CONFIDENCE_THRESHOLD and id2label[idx] in AST_TARGET_EVENTS
+    ]
+
 
 def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Pipeline:
     global _diarization_pipeline
@@ -84,6 +154,7 @@ class WhisperService:
             process_audio_schema.initial_prompt,
             process_audio_schema.vad_filter,
             process_audio_schema.hallucination_silence_threshold,
+            process_audio_schema.classify_events,
         )
 
         speaker_set = set()
@@ -108,7 +179,8 @@ class WhisperService:
                     processed_speaker=int(str(turn["speaker"]).split("_")[1]) + 1,
                     speaker=turn["speaker"],
                     processed_start= round(turn["start"], 2),
-                    processed_end=round(turn["end"], 2)
+                    processed_end=round(turn["end"], 2),
+                    audio_events=turn["audio_events"],
                 ) for turn in results
             ],
             processing_time_start=processing_time_start,
@@ -121,7 +193,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None, classify_events: Optional[bool] = False) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -153,6 +225,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     print(f"  clustering_threshold:         {clustering_threshold}")
     print(f"  min_duration_off:             {min_duration_off}")
     print(f"  min_cluster_size:             {min_cluster_size}")
+    print(f"  classify_events:              {classify_events or False}")
     print("=" * 50)
 
     print("Transcribing...")
@@ -191,6 +264,14 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     words_with_speakers = assign_word_speakers(file_path, result_segments, diarization_pipeline, num_of_speakers)
     speaker_turns = group_by_speaker_turns(words_with_speakers)
+
+    if classify_events:
+        print(f"Classifying audio events for {len(speaker_turns)} turns...")
+        for turn in speaker_turns:
+            turn["audio_events"] = classify_audio_segment(file_path, turn["start"], turn["end"])
+    else:
+        for turn in speaker_turns:
+            turn["audio_events"] = []
 
     return speaker_turns, info
 
