@@ -1,0 +1,37 @@
+For verbatim mode
+condition_on_previous_text = False
+Reason is, When True, Whisper uses earlier decoded text as context for future decoding.
+So when True 
+This "Um... yeah... I, I think... mhmm... maybe..." becomes "Yeah, I think maybe."
+
+
+For the initial prompt 
+initial_prompt="""
+Verbatim conversational transcript.
+
+Preserve filler words and disfluencies:
+um, uh, hmm, mm-hmm, uh-huh, repetitions,
+false starts, stutters.
+
+Preserve vocal sounds and events:
+[laughter]
+[cough]
+[sigh]
+[breathing]
+[clears throat]
+
+Do not clean grammar.
+Do not remove repetitions.
+Transcribe exactly as spoken.
+""",
+
+
+
+For the beam_size
+We set a lower beam size
+beam_size=1,
+
+
+For vad_filter
+Set this to False
+vad_filter=False,
