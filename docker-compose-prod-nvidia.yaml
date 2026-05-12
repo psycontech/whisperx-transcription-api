@@ -9,7 +9,7 @@ services:
 
     container_name: whisper_cuda
   
-    restart: unless-stopped
+    restart: always 
 
     environment:
       - PYTHON_ENV=production
