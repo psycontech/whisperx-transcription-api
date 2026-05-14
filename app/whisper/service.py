@@ -11,6 +11,7 @@ from app.file.service import FileService
 from typing import Any, Annotated, Optional, Tuple
 from faster_whisper.transcribe import TranscriptionInfo # type: ignore
 from concurrent.futures import ThreadPoolExecutor
+from transformers import ASTFeatureExtractor, AutoModelForAudioClassification  # type: ignore
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
 
@@ -18,9 +19,46 @@ thread_pool_executor = ThreadPoolExecutor(max_workers=4)
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
+_ast_model = None
+_ast_feature_extractor = None
 
 whisper_model_lock = threading.Lock()
 diarization_pipeline_lock = threading.Lock()
+_ast_lock = threading.Lock()
+
+AST_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
+AST_CONFIDENCE_THRESHOLD = 0.1
+AST_TARGET_EVENTS = {
+    "Music", "Laughter", "Cough", "Silence", "Singing", "Speech",
+    "Male speech, man speaking", "Female speech, woman speaking",
+    "Child speech, kid speaking", "Conversation", "Narration, monologue",
+    "Background music", "Vocal music", "Sneeze", "Breathing", "Crying, sobbing",
+}
+AST_EMBEDDABLE_EVENTS = {"Cough", "Laughter", "Sneeze", "Breathing", "Crying, sobbing"}
+
+AST_WINDOW_SIZE = 1.5
+AST_STEP_SIZE = 0.5
+AST_EMBED_THRESHOLD = 0.07
+
+# Whisper sometimes transcribes non-verbal sounds inline as "(laughing)", "(cough)", etc.
+# This maps those annotation keywords to our standardized event label strings.
+WHISPER_ANNOTATION_MAP = {
+    "laughing":  "Laughter",
+    "laughter":  "Laughter",
+    "laugh":     "Laughter",
+    "coughing":  "Cough",
+    "cough":     "Cough",
+    "sneezing":  "Sneeze",
+    "sneeze":    "Sneeze",
+    "crying":    "Crying, sobbing",
+    "sobbing":   "Crying, sobbing",
+    "breathing": "Breathing",
+    "sighing":   "Breathing",
+    "sigh":      "Breathing",
+    "music":     "Music",
+    "singing":   "Singing",
+    "applause":  "Applause",
+}
 
 def get_whisper_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
     global _whisper_model
@@ -29,6 +67,262 @@ def get_whisper_model(model_size: str, device: str, compute_type: str) -> Whispe
             print("Loading Whisper model...")
             _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     return _whisper_model
+
+def get_ast_model():
+    global _ast_model, _ast_feature_extractor
+    with _ast_lock:
+        if _ast_model is None:
+            print("Loading AST audio classification model...")
+            _ast_feature_extractor = ASTFeatureExtractor.from_pretrained(AST_MODEL_ID)
+            _ast_model = AutoModelForAudioClassification.from_pretrained(AST_MODEL_ID)
+            _ast_model.eval()
+            if torch.cuda.is_available():
+                _ast_model = _ast_model.to(torch.device("cuda"))
+    return _ast_model, _ast_feature_extractor
+
+
+def extract_whisper_annotations(words: list) -> list[tuple[float, str]]:
+    """
+    Scan Whisper word tokens for inline non-verbal annotations like (laughing).
+
+    Whisper marks sounds it hears but can't transcribe as speech using parenthetical
+    tokens, e.g. "(laughing)" or "(cough)". These come with word-level timestamps
+    so we know exactly when they occurred.
+
+    Returns a list of (timestamp, event_label) tuples sorted by timestamp.
+    """
+    import re
+    detected = []
+    i = 0
+
+    while i < len(words):
+        word_text = words[i]["word"].strip()
+
+        # Case 1 — single-word annotation: (laughing)  (cough)
+        # The entire token is wrapped in parentheses with one word inside.
+        single_match = re.match(r'^\((\w+)\)$', word_text)
+        if single_match:
+            keyword = single_match.group(1).lower()
+            if keyword in WHISPER_ANNOTATION_MAP:
+                detected.append((words[i]["start"], WHISPER_ANNOTATION_MAP[keyword]))
+            i += 1
+            continue
+
+        # Case 2 — multi-word annotation split across tokens: (upbeat  →  music)
+        # faster-whisper splits on word boundaries, so "(upbeat music)" becomes two
+        # tokens: "(upbeat" and "music)". We scan forward to collect the full phrase.
+        if word_text.startswith('(') and not word_text.endswith(')') and len(word_text) > 1:
+            phrase_parts = [word_text.lstrip('(').lower()]
+            start_ts = words[i]["start"]
+            j = i + 1
+
+            while j < len(words):
+                next_text = words[j]["word"].strip()
+                if next_text.endswith(')'):
+                    phrase_parts.append(next_text.rstrip(')').lower())
+                    j += 1
+                    break
+                phrase_parts.append(next_text.lower())
+                j += 1
+
+            # Join the collected parts into a full phrase, e.g. "upbeat music"
+            phrase = ' '.join(p for p in phrase_parts if p).strip()
+
+            # Try the exact phrase first, then fall back to matching any individual word.
+            # e.g. "upbeat music" → no exact match → "upbeat" misses → "music" → "Music"
+            label = WHISPER_ANNOTATION_MAP.get(phrase)
+            if label is None:
+                for part in phrase.split():
+                    if part in WHISPER_ANNOTATION_MAP:
+                        label = WHISPER_ANNOTATION_MAP[part]
+                        break
+
+            if label:
+                detected.append((start_ts, label))
+
+            i = j  # Skip all tokens that were part of this annotation span
+            continue
+
+        i += 1
+
+    return detected
+
+
+def classify_audio_segment(audio_file_path: str, start: float, end: float, words: list = []) -> list[str]:
+    import numpy as np
+    TARGET_SR = 16000
+
+    # --- Source 1: Whisper inline annotations ---
+    # Highly reliable — Whisper only adds these when it's confident.
+    # We collect just the unique label strings for the audio_events list.
+    whisper_labels = {label for _, label in extract_whisper_annotations(words)}
+
+    # --- Source 2: AST model classifying the full turn audio ---
+    # Catches events Whisper didn't transcribe (e.g. background music, subtle breathing).
+    waveform, sr = safe_load_audio(audio_file_path)
+    start_frame = max(0, int(start * sr))
+    end_frame = min(waveform.shape[-1], int(end * sr))
+
+    if end_frame <= start_frame:
+        # No audio slice to analyse — return whatever Whisper found
+        return list(whisper_labels)
+
+    waveform = waveform[:, start_frame:end_frame]
+
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    if sr != TARGET_SR:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_SR)
+        waveform = resampler(waveform)
+
+    audio_np = waveform.squeeze(0).numpy().astype(np.float32)
+
+    if len(audio_np) < TARGET_SR * 0.1:
+        return list(whisper_labels)
+
+    model, feature_extractor = get_ast_model()
+    inputs = feature_extractor(audio_np, sampling_rate=TARGET_SR, return_tensors="pt")
+
+    if torch.cuda.is_available():
+        inputs = {k: v.to(torch.device("cuda")) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    probs = torch.sigmoid(outputs.logits).squeeze(0)
+    id2label = model.config.id2label
+
+    ast_labels = {
+        id2label[idx]
+        for idx, score in enumerate(probs.tolist())
+        if score >= AST_CONFIDENCE_THRESHOLD and id2label[idx] in AST_TARGET_EVENTS
+    }
+
+    # Merge both sources — union of all detected labels across Whisper and AST
+    return list(whisper_labels | ast_labels)
+
+
+def embed_events_in_text(audio_file_path: str, start: float, end: float, words: list) -> str:
+    import re
+    import numpy as np
+    TARGET_SR = 16000
+
+    if not words:
+        return ""
+
+    # --- Source 1: Whisper inline annotations ---
+    # Pull events that Whisper already flagged with precise word-level timestamps.
+    # These are our most reliable position markers, so we process them first.
+    whisper_detections = extract_whisper_annotations(words)
+
+    # --- Source 2: AST sliding window on the raw audio ---
+    # Runs a small classification window across the turn to catch events Whisper
+    # didn't transcribe (e.g. quiet breathing, background sounds between words).
+    waveform, sr = safe_load_audio(audio_file_path)
+
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != TARGET_SR:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_SR)
+        waveform = resampler(waveform)
+
+    start_frame = max(0, int(start * TARGET_SR))
+    end_frame = min(waveform.shape[-1], int(end * TARGET_SR))
+    audio_np = waveform.squeeze(0)[start_frame:end_frame].numpy().astype(np.float32)
+
+    ast_detections: list[tuple[float, str]] = []
+
+    if len(audio_np) >= TARGET_SR * 0.1:
+        model, feature_extractor = get_ast_model()
+        window_samples = int(AST_WINDOW_SIZE * TARGET_SR)
+        step_samples = int(AST_STEP_SIZE * TARGET_SR)
+        total_samples = len(audio_np)
+        window_start = 0
+
+        while window_start < total_samples:
+            window_end = min(window_start + window_samples, total_samples)
+            window_audio = audio_np[window_start:window_end]
+
+            if len(window_audio) < TARGET_SR * 0.1:
+                break
+
+            inputs = feature_extractor(window_audio, sampling_rate=TARGET_SR, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {k: v.to(torch.device("cuda")) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            probs = torch.sigmoid(outputs.logits).squeeze(0)
+            id2label = model.config.id2label
+            # Absolute timestamp of the centre of this window
+            window_mid_abs = start + (window_start + (window_end - window_start) / 2) / TARGET_SR
+
+            for idx, score in enumerate(probs.tolist()):
+                label = id2label[idx]
+                if score >= AST_EMBED_THRESHOLD and label in AST_EMBEDDABLE_EVENTS:
+                    ast_detections.append((window_mid_abs, label))
+
+            window_start += step_samples
+
+    # --- Merge and deduplicate ---
+    # Whisper detections go first so their timestamps win when both sources
+    # detect the same event within 1 second of each other.
+    all_detections = whisper_detections + ast_detections
+    deduped: list[tuple[float, str]] = []
+    for ts, label in all_detections:
+        already_present = any(
+            label == prev_label and abs(ts - prev_ts) < 1.0
+            for prev_ts, prev_label in deduped
+        )
+        if not already_present:
+            deduped.append((ts, label))
+
+    # Sort by timestamp so we can walk left-to-right through the word stream
+    deduped.sort(key=lambda x: x[0])
+
+    # --- Build the output text ---
+    # Walk words in order, inserting [Event] markers at the right positions.
+    # Whisper annotation tokens — both single-word "(laughing)" and multi-word
+    # "(upbeat music)" — are SKIPPED because they're replaced by our [Event] markers.
+    event_idx = 0
+    tokens = []
+    in_annotation_span = False  # Tracks whether we're inside a multi-word annotation
+
+    for word in words:
+        word_stripped = word["word"].strip()
+
+        # Insert any [Event] markers whose timestamp falls before this word starts.
+        # We do this even for annotation tokens so the marker lands at the right position.
+        while event_idx < len(deduped) and deduped[event_idx][0] <= word["start"]:
+            tokens.append(f" [{deduped[event_idx][1]}]")
+            event_idx += 1
+
+        # Detect and skip single-word annotations: (laughing)
+        if re.match(r'^\((\w+)\)$', word_stripped):
+            continue
+
+        # Detect the start of a multi-word annotation span: (upbeat  or  (crowd
+        if word_stripped.startswith('(') and not word_stripped.endswith(')') and len(word_stripped) > 1:
+            in_annotation_span = True
+            continue  # Skip this opening token
+
+        # If we're inside a multi-word span, skip tokens until we see the closing )
+        if in_annotation_span:
+            if word_stripped.endswith(')'):
+                in_annotation_span = False  # Closing token — span ends here
+            continue  # Skip all tokens within the span
+
+        tokens.append(word["word"])
+
+    # Flush any events that fall after the last word
+    while event_idx < len(deduped):
+        tokens.append(f" [{deduped[event_idx][1]}]")
+        event_idx += 1
+
+    return "".join(tokens).strip()
+
 
 def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Pipeline:
     global _diarization_pipeline
@@ -84,6 +378,7 @@ class WhisperService:
             process_audio_schema.initial_prompt,
             process_audio_schema.vad_filter,
             process_audio_schema.hallucination_silence_threshold,
+            process_audio_schema.classify_events,
         )
 
         speaker_set = set()
@@ -108,7 +403,9 @@ class WhisperService:
                     processed_speaker=int(str(turn["speaker"]).split("_")[1]) + 1,
                     speaker=turn["speaker"],
                     processed_start= round(turn["start"], 2),
-                    processed_end=round(turn["end"], 2)
+                    processed_end=round(turn["end"], 2),
+                    audio_events=turn["audio_events"],
+                    text_with_events=turn["text_with_events"],
                 ) for turn in results
             ],
             processing_time_start=processing_time_start,
@@ -121,7 +418,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None, classify_events: Optional[bool] = False) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -153,6 +450,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     print(f"  clustering_threshold:         {clustering_threshold}")
     print(f"  min_duration_off:             {min_duration_off}")
     print(f"  min_cluster_size:             {min_cluster_size}")
+    print(f"  classify_events:              {classify_events or False}")
     print("=" * 50)
 
     print("Transcribing...")
@@ -192,11 +490,46 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     words_with_speakers = assign_word_speakers(file_path, result_segments, diarization_pipeline, num_of_speakers)
     speaker_turns = group_by_speaker_turns(words_with_speakers)
 
+    if classify_events:
+        print(f"Classifying audio events for {len(speaker_turns)} turns...")
+        for i, turn in enumerate(speaker_turns):
+            turn_words = [w for w in words_with_speakers if turn["start"] <= w["start"] <= turn["end"]]
+            # Pass words so both classify_ and embed_ can mine Whisper annotations
+            turn["audio_events"] = classify_audio_segment(file_path, turn["start"], turn["end"], turn_words)
+            turn["text_with_events"] = embed_events_in_text(file_path, turn["start"], turn["end"], turn_words)
+
+            # Log what was found for this turn
+            print(f"  Turn {i + 1} [{turn['start']:.2f}s → {turn['end']:.2f}s] {turn['speaker']}")
+            if turn["audio_events"]:
+                print(f"    events:  {turn['audio_events']}")
+            else:
+                print("    events:  none")
+    else:
+        for turn in speaker_turns:
+            turn["audio_events"] = []
+            turn["text_with_events"] = None
+
     return speaker_turns, info
 
 
+def safe_load_audio(audio_file_path: str):
+    import os
+    tmp_wav_path = None
+    try:
+        return torchaudio.load(str(audio_file_path))
+    except RuntimeError:
+        from pydub import AudioSegment
+        tmp_wav_path = str(audio_file_path) + "_converted.wav"
+        AudioSegment.from_file(audio_file_path).export(tmp_wav_path, format="wav")
+        waveform, sample_rate = torchaudio.load(tmp_wav_path)
+        return waveform, sample_rate
+    finally:
+        if tmp_wav_path and os.path.exists(tmp_wav_path):
+            os.remove(tmp_wav_path)
+
+
 def pad_audio(audio_file_path: str) -> dict:
-    waveform, sample_rate = torchaudio.load(str(audio_file_path))
+    waveform, sample_rate = safe_load_audio(audio_file_path)
 
     chunk_size = 160000
     remainder = waveform.shape[-1] % chunk_size
