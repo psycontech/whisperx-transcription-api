@@ -93,15 +93,57 @@ def extract_whisper_annotations(words: list) -> list[tuple[float, str]]:
     """
     import re
     detected = []
+    i = 0
 
-    for word in words:
-        # Whisper annotation tokens look exactly like "(word)" — parentheses wrapping one keyword.
-        # We strip surrounding whitespace then check for that pattern.
-        match = re.match(r'^\s*\((\w+)\)\s*$', word["word"])
-        if match:
-            keyword = match.group(1).lower()
+    while i < len(words):
+        word_text = words[i]["word"].strip()
+
+        # Case 1 — single-word annotation: (laughing)  (cough)
+        # The entire token is wrapped in parentheses with one word inside.
+        single_match = re.match(r'^\((\w+)\)$', word_text)
+        if single_match:
+            keyword = single_match.group(1).lower()
             if keyword in WHISPER_ANNOTATION_MAP:
-                detected.append((word["start"], WHISPER_ANNOTATION_MAP[keyword]))
+                detected.append((words[i]["start"], WHISPER_ANNOTATION_MAP[keyword]))
+            i += 1
+            continue
+
+        # Case 2 — multi-word annotation split across tokens: (upbeat  →  music)
+        # faster-whisper splits on word boundaries, so "(upbeat music)" becomes two
+        # tokens: "(upbeat" and "music)". We scan forward to collect the full phrase.
+        if word_text.startswith('(') and not word_text.endswith(')') and len(word_text) > 1:
+            phrase_parts = [word_text.lstrip('(').lower()]
+            start_ts = words[i]["start"]
+            j = i + 1
+
+            while j < len(words):
+                next_text = words[j]["word"].strip()
+                if next_text.endswith(')'):
+                    phrase_parts.append(next_text.rstrip(')').lower())
+                    j += 1
+                    break
+                phrase_parts.append(next_text.lower())
+                j += 1
+
+            # Join the collected parts into a full phrase, e.g. "upbeat music"
+            phrase = ' '.join(p for p in phrase_parts if p).strip()
+
+            # Try the exact phrase first, then fall back to matching any individual word.
+            # e.g. "upbeat music" → no exact match → "upbeat" misses → "music" → "Music"
+            label = WHISPER_ANNOTATION_MAP.get(phrase)
+            if label is None:
+                for part in phrase.split():
+                    if part in WHISPER_ANNOTATION_MAP:
+                        label = WHISPER_ANNOTATION_MAP[part]
+                        break
+
+            if label:
+                detected.append((start_ts, label))
+
+            i = j  # Skip all tokens that were part of this annotation span
+            continue
+
+        i += 1
 
     return detected
 
@@ -242,23 +284,35 @@ def embed_events_in_text(audio_file_path: str, start: float, end: float, words: 
 
     # --- Build the output text ---
     # Walk words in order, inserting [Event] markers at the right positions.
-    # Whisper annotation tokens like "(laughing)" are SKIPPED — they're replaced
-    # by the standardized [Laughter] marker we already inserted from whisper_detections.
-    annotation_re = re.compile(r'^\s*\((\w+)\)\s*$')
-
+    # Whisper annotation tokens — both single-word "(laughing)" and multi-word
+    # "(upbeat music)" — are SKIPPED because they're replaced by our [Event] markers.
     event_idx = 0
     tokens = []
+    in_annotation_span = False  # Tracks whether we're inside a multi-word annotation
 
     for word in words:
-        # Insert any [Event] markers whose timestamp falls before this word starts
+        word_stripped = word["word"].strip()
+
+        # Insert any [Event] markers whose timestamp falls before this word starts.
+        # We do this even for annotation tokens so the marker lands at the right position.
         while event_idx < len(deduped) and deduped[event_idx][0] <= word["start"]:
             tokens.append(f" [{deduped[event_idx][1]}]")
             event_idx += 1
 
-        # Drop Whisper annotation tokens — already represented as [Event] markers above
-        word_match = annotation_re.match(word["word"])
-        if word_match and word_match.group(1).lower() in WHISPER_ANNOTATION_MAP:
+        # Detect and skip single-word annotations: (laughing)
+        if re.match(r'^\((\w+)\)$', word_stripped):
             continue
+
+        # Detect the start of a multi-word annotation span: (upbeat  or  (crowd
+        if word_stripped.startswith('(') and not word_stripped.endswith(')') and len(word_stripped) > 1:
+            in_annotation_span = True
+            continue  # Skip this opening token
+
+        # If we're inside a multi-word span, skip tokens until we see the closing )
+        if in_annotation_span:
+            if word_stripped.endswith(')'):
+                in_annotation_span = False  # Closing token — span ends here
+            continue  # Skip all tokens within the span
 
         tokens.append(word["word"])
 
@@ -438,11 +492,18 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
 
     if classify_events:
         print(f"Classifying audio events for {len(speaker_turns)} turns...")
-        for turn in speaker_turns:
+        for i, turn in enumerate(speaker_turns):
             turn_words = [w for w in words_with_speakers if turn["start"] <= w["start"] <= turn["end"]]
             # Pass words so both classify_ and embed_ can mine Whisper annotations
             turn["audio_events"] = classify_audio_segment(file_path, turn["start"], turn["end"], turn_words)
             turn["text_with_events"] = embed_events_in_text(file_path, turn["start"], turn["end"], turn_words)
+
+            # Log what was found for this turn
+            print(f"  Turn {i + 1} [{turn['start']:.2f}s → {turn['end']:.2f}s] {turn['speaker']}")
+            if turn["audio_events"]:
+                print(f"    events:  {turn['audio_events']}")
+            else:
+                print("    events:  none")
     else:
         for turn in speaker_turns:
             turn["audio_events"] = []
