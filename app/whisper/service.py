@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import torch
 import torchaudio # type: ignore
 import threading
+import os
 from fastapi import Depends
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
@@ -60,13 +63,43 @@ WHISPER_ANNOTATION_MAP = {
     "applause":  "Applause",
 }
 
-def get_whisper_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
+def get_whisper_model(model_size_or_path: str, device: str, compute_type: str) -> WhisperModel:
     global _whisper_model
     with whisper_model_lock:
         if _whisper_model is None:
-            print("Loading Whisper model...")
-            _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            resolved_path = model_size_or_path
+            if model_size_or_path.startswith("/models") or model_size_or_path.startswith("models"):
+                project_root = Path(__file__).resolve().parent.parent.parent
+                resolved_path = str(project_root / model_size_or_path.lstrip("/"))
+            
+            print(f"Loading Whisper model: {model_size_or_path}")
+            print(f"Resolved path: {resolved_path}")
+            print(f"Is local path: {os.path.isdir(resolved_path)}")
+            
+            if os.path.isdir(resolved_path):
+                _whisper_model = WhisperModel(resolved_path, device=device, compute_type=compute_type, local_files_only=True)
+            else:
+                _whisper_model = WhisperModel(model_size_or_path, device=device, compute_type=compute_type)
+            
+            # Self-healing mel filter patch
+            expected_n_mels = _whisper_model.model.n_mels
+            current_n_mels = _whisper_model.feature_extractor.mel_filters.shape[0]
+            
+            if expected_n_mels != current_n_mels:
+                import numpy as np
+                print(f"Patching mel filters: {current_n_mels} → {expected_n_mels} bins")
+                new_filters = _whisper_model.feature_extractor.get_mel_filters(
+                    _whisper_model.feature_extractor.sampling_rate,
+                    _whisper_model.feature_extractor.n_fft,
+                    n_mels=expected_n_mels,
+                )
+                # CTranslate2 requires float32, but get_mel_filters returns float64
+                _whisper_model.feature_extractor.mel_filters = new_filters.astype(np.float32)
+            else:
+                print(f"Mel filters already correct ({current_n_mels} bins)")
+    
     return _whisper_model
+
 
 def get_ast_model():
     global _ast_model, _ast_feature_extractor
@@ -364,7 +397,7 @@ class WhisperService:
             self.thread_pool_executor,
             transcribe_audio,
             file.path,
-            self.settings.WHISPER_MODEL_SIZE,
+            self.settings.WHISPER_MODEL_SIZE_OR_PATH,
             self.settings.WHISPER_MODEL_DEVICE,
             self.settings.WHISPER_COMPUTE_TYPE,
             self.settings.HF_TOKEN,
@@ -418,7 +451,7 @@ class WhisperService:
         return processed_audio_response_schema
     
 
-def transcribe_audio(file_path: str, model_size: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None, classify_events: Optional[bool] = False) -> Tuple[list[Any], TranscriptionInfo]:
+def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None, classify_events: Optional[bool] = False) -> Tuple[list[Any], TranscriptionInfo]:
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -427,7 +460,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
-    whisper_model = get_whisper_model(model_size, device, compute_type)
+    whisper_model = get_whisper_model(model_size_or_path, device, compute_type)
 
     _beam_size = beam_size if beam_size is not None else 3
     _no_speech_threshold = no_speech_threshold if no_speech_threshold is not None else 0.3
@@ -438,7 +471,7 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     print("=" * 50)
     print("TRANSCRIPTION CONFIG")
     print(f"  beam_size:                    {_beam_size}")
-    print(f"  model_size:                   {model_size}")
+    print(f"  model_size_or_path:           {model_size_or_path}")
     print(f"  compute_type:                 {compute_type}")
     print(f"  device:                       {device}")
     print(f"  language:                     {language or 'auto-detect'}")

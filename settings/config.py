@@ -47,6 +47,8 @@ class GlobalConfig(BaseSettings):
     WHISPER_MODEL_DEVICE: str = Field("cpu", env="WHISPER_MODEL_DEVICE") # type: ignore
     WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE") # type: ignore
 
+    WHISPER_MODEL_SIZE_OR_PATH: str = Field("/models/whisper-german-ct2", env="WHISPER_MODEL_SIZE_OR_PATH") # type: ignore
+
     # Diarization tuning parameters
     DIARIZATION_CLUSTERING_THRESHOLD: float = Field(0.7045, env="DIARIZATION_CLUSTERING_THRESHOLD") # type: ignore
     DIARIZATION_MIN_DURATION_OFF: float = Field(0.0, env="DIARIZATION_MIN_DURATION_OFF") # type: ignore

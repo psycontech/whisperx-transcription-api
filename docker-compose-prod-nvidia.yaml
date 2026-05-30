@@ -1,4 +1,16 @@
 services:
+  conver_whisper_model:
+    build: 
+      context: .
+      dockerfile: Dockerfile-nvidia
+
+    container_name: conver_whisper_model
+
+    volumes:
+      - ./models:/models
+
+    entrypoint: ["bash", "convert_whisper_model_v3_german_ct_translate.sh"]
+  
   whisper:
     build: 
       context: .
@@ -9,7 +21,14 @@ services:
 
     container_name: whisper_cuda
   
-    restart: always 
+    restart: always
+
+    volumes:
+      - ./models:/models
+
+    depends_on:
+      conver_whisper_model:
+        condition: service_completed_successfully
 
     environment:
       - PYTHON_ENV=production
@@ -17,12 +36,9 @@ services:
       - PORT=${PORT}
       - PYTHONUNBUFFERED=1
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE}
+      - WHISPER_MODEL_SIZE_OR_PATH=/models/whisper-v3-german-ct2
       - WHISPER_MODEL_DEVICE=${WHISPER_MODEL_DEVICE}
       - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}
-      - DIARIZATION_CLUSTERING_THRESHOLD=${DIARIZATION_CLUSTERING_THRESHOLD}
-      - DIARIZATION_MIN_DURATION_OFF=${DIARIZATION_MIN_DURATION_OFF}
-      - DIARIZATION_MIN_CLUSTER_SIZE=${DIARIZATION_MIN_CLUSTER_SIZE}
-
 
     deploy:
       resources:
