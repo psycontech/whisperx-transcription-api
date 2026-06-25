@@ -1,13 +1,16 @@
 from typing import Optional
-from pydantic import PositiveInt, BaseModel, HttpUrl, Field
+from pydantic import PositiveInt, BaseModel, HttpUrl
 
 class ProcessAudioSchema(BaseModel):
     num_of_speakers: Optional[PositiveInt] = None
     audio_file_url: HttpUrl
     language: Optional[str] = None
-    beam_size: Optional[int] = Field(default=None, nullable=True)
-    no_speech_threshold: Optional[float] = Field(default=None, nullable=True)
-    initial_prompt: Optional[str] = Field(default=None, nullable=True)
-    vad_filter: Optional[bool] = Field(default=None, nullable=True)
-    hallucination_silence_threshold: Optional[float] = Field(default=None, nullable=True)
-    classify_events: Optional[bool] = Field(default=False, nullable=True)
+    beam_size: Optional[int] = None
+    no_speech_threshold: Optional[float] = None
+    initial_prompt: Optional[str] = None
+    vad_filter: Optional[bool] = None
+    hallucination_silence_threshold: Optional[float] = None
+    classify_events: Optional[bool] = False
+    clustering_threshold: Optional[float] = None
+    min_duration_off: Optional[float] = None
+    min_cluster_size: Optional[int] = None

@@ -324,7 +324,7 @@ def embed_events_in_text(audio_file_path: str, start: float, end: float, words: 
     return "".join(tokens).strip()
 
 
-def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Pipeline:
+def get_diarization_pipeline(hf_token: str) -> Pipeline:
     global _diarization_pipeline
     with diarization_pipeline_lock:
         if _diarization_pipeline is None:
@@ -333,16 +333,6 @@ def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=hf_token
             )
-            _diarization_pipeline.instantiate({
-                "segmentation": {
-                    "min_duration_off": min_duration_off,
-                },
-                "clustering": {
-                    "threshold": clustering_threshold,
-                    "method": "centroid",
-                    "min_cluster_size": min_cluster_size,
-                }
-            })
             if torch.cuda.is_available():
                 _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
@@ -370,9 +360,9 @@ class WhisperService:
             self.settings.HF_TOKEN,
             process_audio_schema.num_of_speakers,
             process_audio_schema.language,
-            self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
-            self.settings.DIARIZATION_MIN_DURATION_OFF,
-            self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
+            process_audio_schema.clustering_threshold if process_audio_schema.clustering_threshold is not None else self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
+            process_audio_schema.min_duration_off if process_audio_schema.min_duration_off is not None else self.settings.DIARIZATION_MIN_DURATION_OFF,
+            process_audio_schema.min_cluster_size if process_audio_schema.min_cluster_size is not None else self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
             process_audio_schema.beam_size,
             process_audio_schema.no_speech_threshold,
             process_audio_schema.initial_prompt,
@@ -475,7 +465,17 @@ def transcribe_audio(file_path: str, model_size: str, device: str, compute_type:
     else:
         print("CUDA NOT AVAILABLE, USING CPU for Diarization")
    
-    diarization_pipeline = get_diarization_pipeline(hf_token, clustering_threshold, min_duration_off, min_cluster_size)
+    diarization_pipeline = get_diarization_pipeline(hf_token)
+    diarization_pipeline.instantiate({
+        "segmentation": {
+            "min_duration_off": min_duration_off,
+        },
+        "clustering": {
+            "threshold": clustering_threshold,
+            "method": "centroid",
+            "min_cluster_size": min_cluster_size,
+        }
+    })
 
 
     result_segments = []
