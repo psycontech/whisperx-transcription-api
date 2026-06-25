@@ -67,10 +67,16 @@ def get_whisper_model(model_size_or_path: str, device: str, compute_type: str) -
     global _whisper_model
     with whisper_model_lock:
         if _whisper_model is None:
-            resolved_path = model_size_or_path
-            if model_size_or_path.startswith("/models") or model_size_or_path.startswith("models"):
+            # Absolute paths (e.g. /models/...) are used as-is — the docker volume
+            # mounts the model directory directly at that path.
+            # Relative paths (e.g. models/...) are resolved from the project root.
+            if model_size_or_path.startswith("/"):
+                resolved_path = model_size_or_path
+            elif model_size_or_path.startswith("models"):
                 project_root = Path(__file__).resolve().parent.parent.parent
-                resolved_path = str(project_root / model_size_or_path.lstrip("/"))
+                resolved_path = str(project_root / model_size_or_path)
+            else:
+                resolved_path = model_size_or_path
             
             print(f"Loading Whisper model: {model_size_or_path}")
             print(f"Resolved path: {resolved_path}")
