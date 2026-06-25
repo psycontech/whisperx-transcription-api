@@ -357,7 +357,7 @@ def embed_events_in_text(audio_file_path: str, start: float, end: float, words: 
     return "".join(tokens).strip()
 
 
-def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045, min_duration_off: float = 0.0, min_cluster_size: int = 12) -> Pipeline:
+def get_diarization_pipeline(hf_token: str) -> Pipeline:
     global _diarization_pipeline
     with diarization_pipeline_lock:
         if _diarization_pipeline is None:
@@ -366,16 +366,6 @@ def get_diarization_pipeline(hf_token: str, clustering_threshold: float = 0.7045
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=hf_token
             )
-            _diarization_pipeline.instantiate({
-                "segmentation": {
-                    "min_duration_off": min_duration_off,
-                },
-                "clustering": {
-                    "threshold": clustering_threshold,
-                    "method": "centroid",
-                    "min_cluster_size": min_cluster_size,
-                }
-            })
             if torch.cuda.is_available():
                 _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
@@ -403,9 +393,9 @@ class WhisperService:
             self.settings.HF_TOKEN,
             process_audio_schema.num_of_speakers,
             process_audio_schema.language,
-            self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
-            self.settings.DIARIZATION_MIN_DURATION_OFF,
-            self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
+            process_audio_schema.clustering_threshold if process_audio_schema.clustering_threshold is not None else self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
+            process_audio_schema.min_duration_off if process_audio_schema.min_duration_off is not None else self.settings.DIARIZATION_MIN_DURATION_OFF,
+            process_audio_schema.min_cluster_size if process_audio_schema.min_cluster_size is not None else self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
             process_audio_schema.beam_size,
             process_audio_schema.no_speech_threshold,
             process_audio_schema.initial_prompt,
@@ -508,7 +498,17 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
     else:
         print("CUDA NOT AVAILABLE, USING CPU for Diarization")
    
-    diarization_pipeline = get_diarization_pipeline(hf_token, clustering_threshold, min_duration_off, min_cluster_size)
+    diarization_pipeline = get_diarization_pipeline(hf_token)
+    diarization_pipeline.instantiate({
+        "segmentation": {
+            "min_duration_off": min_duration_off,
+        },
+        "clustering": {
+            "threshold": clustering_threshold,
+            "method": "centroid",
+            "min_cluster_size": min_cluster_size,
+        }
+    })
 
 
     result_segments = []
@@ -573,6 +573,72 @@ def pad_audio(audio_file_path: str) -> dict:
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 
+# If one speaker covers at least this fraction of a Whisper segment, all words in that
+# segment are assigned to them without word-level scanning.
+_SEGMENT_DOMINANCE_THRESHOLD = 0.85
+
+# Speaker runs of this many words or fewer that are surrounded on both sides by the same
+# other speaker are collapsed into that surrounding speaker (smoothing pass).
+_ISLAND_MAX_WORDS = 2
+
+
+def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Optional[str]:
+    """Return the speaker whose segment midpoint is closest to the given time range."""
+    mid = (start + end) / 2
+    best_speaker, best_dist = None, float('inf')
+    for turn, _, speaker in tracks:
+        dist = abs(mid - (turn.start + turn.end) / 2)
+        if dist < best_dist:
+            best_dist = dist
+            best_speaker = speaker
+    return best_speaker
+
+
+def _assign_word_speaker_by_overlap(word, tracks: list) -> Optional[str]:
+    """Assign a speaker to a single word using max overlap, falling back to nearest midpoint."""
+    best_speaker, best_overlap = None, 0.0
+    for turn, _, speaker in tracks:
+        overlap = max(0.0, min(word.end, turn.end) - max(word.start, turn.start))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = speaker
+    if best_speaker is None:
+        best_speaker = _nearest_speaker_by_midpoint(word.start, word.end, tracks)
+    return best_speaker
+
+
+def _smooth_speaker_assignments(words: list) -> list:
+    """Collapse short speaker islands surrounded on both sides by the same speaker.
+
+    Iterates until stable so that back-to-back islands are both resolved.
+    """
+    if len(words) < 3:
+        return words
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(words):
+            current_speaker = words[i]['speaker']
+            # Walk to end of this speaker run
+            j = i + 1
+            while j < len(words) and words[j]['speaker'] == current_speaker:
+                j += 1
+
+            run_len = j - i
+            if run_len <= _ISLAND_MAX_WORDS and i > 0 and j < len(words):
+                prev_speaker = words[i - 1]['speaker']
+                next_speaker = words[j]['speaker']
+                if prev_speaker == next_speaker and prev_speaker != current_speaker:
+                    for k in range(i, j):
+                        words[k] = {**words[k], 'speaker': prev_speaker}
+                    changed = True
+            i = j
+
+    return words
+
+
 def assign_word_speakers(audio_file_path: str, transcription_segments, diarization_pipeline: Pipeline, num_of_speakers: Optional[int] = None):
     print("Diarizing audio...")
     diarization_kwargs = {}
@@ -581,53 +647,52 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
         diarization_kwargs["min_speakers"] = num_of_speakers
         diarization_kwargs["max_speakers"] = num_of_speakers
 
-    
     # Pad audio file with empty audio after chunk split
     audio_input = pad_audio(audio_file_path)
 
     diarization = diarization_pipeline(audio_input, **diarization_kwargs)
+    tracks = list(diarization.itertracks(yield_label=True))
+
     words_with_speakers = []
-    
+
     for segment in transcription_segments:
-        if segment['words'] is None:
+        if not segment['words']:
             continue
-            
-        for word in segment['words']:
-            assigned_speaker = None
-            max_overlap = 0
-            
-            diarization_tracks = list(diarization.itertracks(yield_label=True))
 
-            for turn, _, speaker in diarization_tracks:
-                overlap_start = max(word.start, turn.start)
-                overlap_end = min(word.end, turn.end)
-                overlap = max(0, overlap_end - overlap_start)
+        seg_start: float = segment['start']
+        seg_end: float = segment['end']
+        seg_duration = seg_end - seg_start
 
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    assigned_speaker = speaker
+        # Tally each speaker's total overlap with the full Whisper segment
+        speaker_overlap: dict[str, float] = {}
+        for turn, _, speaker in tracks:
+            overlap = max(0.0, min(seg_end, turn.end) - max(seg_start, turn.start))
+            if overlap > 0:
+                speaker_overlap[speaker] = speaker_overlap.get(speaker, 0.0) + overlap
 
-            if assigned_speaker is None:
-                word_mid = (word.start + word.end) / 2
-                min_distance = float('inf')
-                for turn, _, speaker in diarization_tracks:
-                    turn_mid = (turn.start + turn.end) / 2
-                    distance = abs(word_mid - turn_mid)
-                    if distance < min_distance:
-                        min_distance = distance
-                        assigned_speaker = speaker
+        if not speaker_overlap:
+            # No diarization coverage at all — use nearest speaker for every word
+            fallback = _nearest_speaker_by_midpoint(seg_start, seg_end, tracks)
+            for word in segment['words']:
+                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': fallback})
+            continue
 
-            if assigned_speaker is None:
-                print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
+        dominant_speaker = max(speaker_overlap, key=speaker_overlap.get)
+        dominance_ratio = speaker_overlap[dominant_speaker] / seg_duration if seg_duration > 0 else 1.0
 
-            words_with_speakers.append({
-                'word': word.word,
-                'start': word.start,
-                'end': word.end,
-                'speaker': assigned_speaker
-            })
-    
-    return words_with_speakers
+        if dominance_ratio >= _SEGMENT_DOMINANCE_THRESHOLD:
+            # One speaker clearly owns this segment — assign every word to them
+            for word in segment['words']:
+                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': dominant_speaker})
+        else:
+            # Genuine speaker change mid-segment — fall back to word-level overlap
+            for word in segment['words']:
+                assigned = _assign_word_speaker_by_overlap(word, tracks)
+                if assigned is None:
+                    print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
+                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': assigned})
+
+    return _smooth_speaker_assignments(words_with_speakers)
 
 
 def group_by_speaker_turns(words_with_speakers: list[Any]):
