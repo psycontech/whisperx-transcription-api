@@ -1,4 +1,4 @@
-MODEL_DIR="./models/whisper-v3-german-ct2"
+MODEL_DIR="/models/whisper-v3-german-ct2"
 
 if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/model.bin" ]; then
   echo "Model already exists, skipping conversion..."
