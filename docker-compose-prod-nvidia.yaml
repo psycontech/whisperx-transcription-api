@@ -1,10 +1,10 @@
 services:
-  conver_whisper_model:
+  convert_whisper_model:
     build: 
       context: .
       dockerfile: Dockerfile-nvidia
 
-    container_name: conver_whisper_model
+    container_name: convert_whisper_model
 
     volumes:
       - ./models:/models
@@ -27,7 +27,7 @@ services:
       - ./models:/models
 
     depends_on:
-      conver_whisper_model:
+      convert_whisper_model:
         condition: service_completed_successfully
 
     environment:
