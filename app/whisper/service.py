@@ -581,11 +581,11 @@ def pad_audio(audio_file_path: str) -> dict:
 
 # If one speaker covers at least this fraction of a Whisper segment, all words in that
 # segment are assigned to them without word-level scanning.
-_SEGMENT_DOMINANCE_THRESHOLD = 0.85
+_SEGMENT_DOMINANCE_THRESHOLD = 0.70
 
 # Speaker runs of this many words or fewer that are surrounded on both sides by the same
 # other speaker are collapsed into that surrounding speaker (smoothing pass).
-_ISLAND_MAX_WORDS = 2
+_ISLAND_MAX_WORDS = 1
 
 
 def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Optional[str]:
