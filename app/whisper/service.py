@@ -579,10 +579,6 @@ def pad_audio(audio_file_path: str) -> dict:
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 
-# If one speaker covers at least this fraction of a Whisper segment, all words in that
-# segment are assigned to them without word-level scanning.
-_SEGMENT_DOMINANCE_THRESHOLD = 0.70
-
 # Speaker runs of this many words or fewer that are surrounded on both sides by the same
 # other speaker are collapsed into that surrounding speaker (smoothing pass).
 _ISLAND_MAX_WORDS = 1
@@ -600,17 +596,19 @@ def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Opti
     return best_speaker
 
 
-def _assign_word_speaker_by_overlap(word, tracks: list) -> Optional[str]:
-    """Assign a speaker to a single word using max overlap, falling back to nearest midpoint."""
-    best_speaker, best_overlap = None, 0.0
+def _assign_word_speaker_by_midpoint(word, tracks: list) -> Optional[str]:
+    """Assign speaker by finding which diarization segment contains the word's midpoint.
+
+    Using midpoint rather than overlap avoids boundary ambiguity — a word that straddles
+    a speaker change gets assigned to whichever speaker owns its centre, not whichever
+    segment happens to have slightly more physical overlap with its edges.
+    Falls back to nearest segment midpoint when the word's centre falls in a gap.
+    """
+    mid = (word.start + word.end) / 2
     for turn, _, speaker in tracks:
-        overlap = max(0.0, min(word.end, turn.end) - max(word.start, turn.start))
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_speaker = speaker
-    if best_speaker is None:
-        best_speaker = _nearest_speaker_by_midpoint(word.start, word.end, tracks)
-    return best_speaker
+        if turn.start <= mid <= turn.end:
+            return speaker
+    return _nearest_speaker_by_midpoint(word.start, word.end, tracks)
 
 
 def _smooth_speaker_assignments(words: list) -> list:
@@ -665,38 +663,11 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
         if not segment['words']:
             continue
 
-        seg_start: float = segment['start']
-        seg_end: float = segment['end']
-        seg_duration = seg_end - seg_start
-
-        # Tally each speaker's total overlap with the full Whisper segment
-        speaker_overlap: dict[str, float] = {}
-        for turn, _, speaker in tracks:
-            overlap = max(0.0, min(seg_end, turn.end) - max(seg_start, turn.start))
-            if overlap > 0:
-                speaker_overlap[speaker] = speaker_overlap.get(speaker, 0.0) + overlap
-
-        if not speaker_overlap:
-            # No diarization coverage at all — use nearest speaker for every word
-            fallback = _nearest_speaker_by_midpoint(seg_start, seg_end, tracks)
-            for word in segment['words']:
-                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': fallback})
-            continue
-
-        dominant_speaker = max(speaker_overlap, key=speaker_overlap.get)
-        dominance_ratio = speaker_overlap[dominant_speaker] / seg_duration if seg_duration > 0 else 1.0
-
-        if dominance_ratio >= _SEGMENT_DOMINANCE_THRESHOLD:
-            # One speaker clearly owns this segment — assign every word to them
-            for word in segment['words']:
-                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': dominant_speaker})
-        else:
-            # Genuine speaker change mid-segment — fall back to word-level overlap
-            for word in segment['words']:
-                assigned = _assign_word_speaker_by_overlap(word, tracks)
-                if assigned is None:
-                    print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
-                words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': assigned})
+        for word in segment['words']:
+            assigned = _assign_word_speaker_by_midpoint(word, tracks)
+            if assigned is None:
+                print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
+            words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': assigned})
 
     return _smooth_speaker_assignments(words_with_speakers)
 
