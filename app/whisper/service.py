@@ -579,9 +579,14 @@ def pad_audio(audio_file_path: str) -> dict:
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 
-# Speaker runs of this many words or fewer that are surrounded on both sides by the same
-# other speaker are collapsed into that surrounding speaker (smoothing pass).
-_ISLAND_MAX_WORDS = 1
+# Within this distance (seconds) of a diarization segment boundary, midpoint assignment
+# is uncertain — fall back to overlap-based comparison for those words.
+_BOUNDARY_ZONE_S = 0.15
+
+# Speaker runs shorter than this duration (seconds) that are surrounded on both sides
+# by the same other speaker are collapsed — catches short mis-assigned bursts regardless
+# of how many words they contain.
+_ISLAND_MAX_DURATION_S = 0.3
 
 
 def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Optional[str]:
@@ -596,25 +601,44 @@ def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Opti
     return best_speaker
 
 
-def _assign_word_speaker_by_midpoint(word, tracks: list) -> Optional[str]:
-    """Assign speaker by finding which diarization segment contains the word's midpoint.
+def _assign_word_speaker_by_overlap(word, tracks: list) -> Optional[str]:
+    """Assign speaker by maximum overlap — used only in the boundary zone."""
+    best_speaker, best_overlap = None, 0.0
+    for turn, _, speaker in tracks:
+        overlap = max(0.0, min(word.end, turn.end) - max(word.start, turn.start))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = speaker
+    if best_speaker is None:
+        best_speaker = _nearest_speaker_by_midpoint(word.start, word.end, tracks)
+    return best_speaker
 
-    Using midpoint rather than overlap avoids boundary ambiguity — a word that straddles
-    a speaker change gets assigned to whichever speaker owns its centre, not whichever
-    segment happens to have slightly more physical overlap with its edges.
-    Falls back to nearest segment midpoint when the word's centre falls in a gap.
+
+def _assign_word_speaker_by_midpoint(word, tracks: list) -> Optional[str]:
+    """Assign speaker by word midpoint with a boundary-zone fallback.
+
+    For words whose midpoint sits well inside a diarization segment, midpoint
+    gives a clean unambiguous answer. For words within _BOUNDARY_ZONE_S of a
+    segment edge (where pyannote timing errors are most likely), we fall back
+    to overlap-based comparison which is more robust in that narrow window.
     """
     mid = (word.start + word.end) / 2
+
     for turn, _, speaker in tracks:
         if turn.start <= mid <= turn.end:
+            near_boundary = (mid - turn.start) < _BOUNDARY_ZONE_S or (turn.end - mid) < _BOUNDARY_ZONE_S
+            if near_boundary:
+                return _assign_word_speaker_by_overlap(word, tracks)
             return speaker
+
     return _nearest_speaker_by_midpoint(word.start, word.end, tracks)
 
 
 def _smooth_speaker_assignments(words: list) -> list:
-    """Collapse short speaker islands surrounded on both sides by the same speaker.
+    """Collapse short-duration speaker islands surrounded on both sides by the same speaker.
 
-    Iterates until stable so that back-to-back islands are both resolved.
+    Uses total run duration rather than word count so that short bursts of multiple
+    fast words (e.g. 'Ja, okay') are also caught. Iterates until stable.
     """
     if len(words) < 3:
         return words
@@ -625,16 +649,15 @@ def _smooth_speaker_assignments(words: list) -> list:
         i = 0
         while i < len(words):
             current_speaker = words[i]['speaker']
-            # Walk to end of this speaker run
             j = i + 1
             while j < len(words) and words[j]['speaker'] == current_speaker:
                 j += 1
 
-            run_len = j - i
-            if run_len <= _ISLAND_MAX_WORDS and i > 0 and j < len(words):
+            if i > 0 and j < len(words):
+                run_duration = words[j - 1]['end'] - words[i]['start']
                 prev_speaker = words[i - 1]['speaker']
                 next_speaker = words[j]['speaker']
-                if prev_speaker == next_speaker and prev_speaker != current_speaker:
+                if run_duration < _ISLAND_MAX_DURATION_S and prev_speaker == next_speaker and prev_speaker != current_speaker:
                     for k in range(i, j):
                         words[k] = {**words[k], 'speaker': prev_speaker}
                     changed = True
