@@ -51,7 +51,7 @@ class GlobalConfig(BaseSettings):
 
     # Diarization tuning parameters
     DIARIZATION_CLUSTERING_THRESHOLD: float = Field(0.7045, env="DIARIZATION_CLUSTERING_THRESHOLD") # type: ignore
-    DIARIZATION_MIN_DURATION_OFF: float = Field(0.5, env="DIARIZATION_MIN_DURATION_OFF") # type: ignore
+    DIARIZATION_MIN_DURATION_OFF: float = Field(0.1, env="DIARIZATION_MIN_DURATION_OFF") # type: ignore
     DIARIZATION_MIN_CLUSTER_SIZE: int = Field(12, env="DIARIZATION_MIN_CLUSTER_SIZE") # type: ignore
 
     # Paths (computed from BASE_DIR at init)
