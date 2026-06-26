@@ -50,7 +50,7 @@ class GlobalConfig(BaseSettings):
     WHISPER_MODEL_SIZE_OR_PATH: str = Field("/models/whisper-german-ct2", env="WHISPER_MODEL_SIZE_OR_PATH") # type: ignore
 
     # Diarization tuning parameters
-    DIARIZATION_CLUSTERING_THRESHOLD: float = Field(0.7045, env="DIARIZATION_CLUSTERING_THRESHOLD") # type: ignore
+    DIARIZATION_CLUSTERING_THRESHOLD: float = Field(0.65, env="DIARIZATION_CLUSTERING_THRESHOLD") # type: ignore
     DIARIZATION_MIN_DURATION_OFF: float = Field(0.1, env="DIARIZATION_MIN_DURATION_OFF") # type: ignore
     DIARIZATION_MIN_CLUSTER_SIZE: int = Field(12, env="DIARIZATION_MIN_CLUSTER_SIZE") # type: ignore
 
