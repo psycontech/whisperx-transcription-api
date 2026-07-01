@@ -18,7 +18,7 @@ from transformers import ASTFeatureExtractor, AutoModelForAudioClassification  #
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
 
-thread_pool_executor = ThreadPoolExecutor(max_workers=4)
+thread_pool_executor = ThreadPoolExecutor(max_workers=8)
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
