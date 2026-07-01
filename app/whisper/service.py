@@ -17,8 +17,12 @@ from concurrent.futures import ThreadPoolExecutor
 from transformers import ASTFeatureExtractor, AutoModelForAudioClassification  # type: ignore
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
+from .schemas.thread_pool_status_schema import ThreadPoolStatusSchema
 
 thread_pool_executor = ThreadPoolExecutor(max_workers=8)
+
+_active_transcriptions_lock = threading.Lock()
+_active_transcriptions = 0
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
@@ -389,26 +393,38 @@ class WhisperService:
 
         processing_time_start = datetime.now(timezone.utc)
 
-        results, transcription_info = await loop.run_in_executor(
-            self.thread_pool_executor,
-            transcribe_audio,
-            file.path,
-            self.settings.WHISPER_MODEL_SIZE_OR_PATH,
-            self.settings.WHISPER_MODEL_DEVICE,
-            self.settings.WHISPER_COMPUTE_TYPE,
-            self.settings.HF_TOKEN,
-            process_audio_schema.num_of_speakers,
-            process_audio_schema.language,
-            process_audio_schema.clustering_threshold if process_audio_schema.clustering_threshold is not None else self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
-            process_audio_schema.min_duration_off if process_audio_schema.min_duration_off is not None else self.settings.DIARIZATION_MIN_DURATION_OFF,
-            process_audio_schema.min_cluster_size if process_audio_schema.min_cluster_size is not None else self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
-            process_audio_schema.beam_size,
-            process_audio_schema.no_speech_threshold,
-            process_audio_schema.initial_prompt,
-            process_audio_schema.vad_filter,
-            process_audio_schema.hallucination_silence_threshold,
-            process_audio_schema.classify_events,
-        )
+        global _active_transcriptions
+        with _active_transcriptions_lock:
+            _active_transcriptions += 1
+            active = _active_transcriptions
+        print(f"[ThreadPool] active={active}/{self.thread_pool_executor._max_workers} queued={self.thread_pool_executor._work_queue.qsize()}")
+
+        try:
+            results, transcription_info = await loop.run_in_executor(
+                self.thread_pool_executor,
+                transcribe_audio,
+                file.path,
+                self.settings.WHISPER_MODEL_SIZE_OR_PATH,
+                self.settings.WHISPER_MODEL_DEVICE,
+                self.settings.WHISPER_COMPUTE_TYPE,
+                self.settings.HF_TOKEN,
+                process_audio_schema.num_of_speakers,
+                process_audio_schema.language,
+                process_audio_schema.clustering_threshold if process_audio_schema.clustering_threshold is not None else self.settings.DIARIZATION_CLUSTERING_THRESHOLD,
+                process_audio_schema.min_duration_off if process_audio_schema.min_duration_off is not None else self.settings.DIARIZATION_MIN_DURATION_OFF,
+                process_audio_schema.min_cluster_size if process_audio_schema.min_cluster_size is not None else self.settings.DIARIZATION_MIN_CLUSTER_SIZE,
+                process_audio_schema.beam_size,
+                process_audio_schema.no_speech_threshold,
+                process_audio_schema.initial_prompt,
+                process_audio_schema.vad_filter,
+                process_audio_schema.hallucination_silence_threshold,
+                process_audio_schema.classify_events,
+            )
+        finally:
+            with _active_transcriptions_lock:
+                _active_transcriptions -= 1
+                active = _active_transcriptions
+            print(f"[ThreadPool] active={active}/{self.thread_pool_executor._max_workers} queued={self.thread_pool_executor._work_queue.qsize()}")
 
         speaker_set = set()
 
@@ -445,7 +461,19 @@ class WhisperService:
         await self.file_service.delete_file(file)
 
         return processed_audio_response_schema
-    
+
+    def get_thread_pool_status(self) -> ThreadPoolStatusSchema:
+        max_workers = self.thread_pool_executor._max_workers
+        with _active_transcriptions_lock:
+            active = _active_transcriptions
+
+        return ThreadPoolStatusSchema(
+            max_workers=max_workers,
+            active_workers=active,
+            available_workers=max(max_workers - active, 0),
+            queued_tasks=self.thread_pool_executor._work_queue.qsize(),
+        )
+
 
 def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compute_type: str, hf_token: str, num_of_speakers: Optional[int] = None, language: Optional[str] = None, clustering_threshold: float = 0.65, min_duration_off: float = 0.1, min_cluster_size: int = 12, beam_size: Optional[int] = None, no_speech_threshold: Optional[float] = None, initial_prompt: Optional[str] = None, vad_filter: Optional[bool] = None, hallucination_silence_threshold: Optional[float] = None, classify_events: Optional[bool] = False) -> Tuple[list[Any], TranscriptionInfo]:
 
