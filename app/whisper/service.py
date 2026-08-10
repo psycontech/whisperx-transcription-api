@@ -7,6 +7,7 @@ import os
 from fastapi import Depends
 from asyncio import get_event_loop
 from pyannote.audio import Pipeline  # type: ignore
+from pyannote.audio.pipelines import OverlappedSpeechDetection  # type: ignore
 from datetime import datetime, timezone
 from settings.config import SettingsDep
 from faster_whisper import WhisperModel # type: ignore
@@ -26,11 +27,14 @@ _active_transcriptions = 0
 
 _whisper_model: Optional[WhisperModel] = None
 _diarization_pipeline: Optional[Pipeline] = None
+_osd_pipeline: Optional[OverlappedSpeechDetection] = None
 _ast_model = None
 _ast_feature_extractor = None
 
 whisper_model_lock = threading.Lock()
 diarization_pipeline_lock = threading.Lock()
+diarization_call_lock = threading.Lock()
+osd_pipeline_lock = threading.Lock()
 _ast_lock = threading.Lock()
 
 AST_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
@@ -380,6 +384,45 @@ def get_diarization_pipeline(hf_token: str) -> Pipeline:
                 _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
 
+
+def get_osd_pipeline(segmentation_model: str = "pyannote/segmentation-3.0") -> OverlappedSpeechDetection:
+    global _osd_pipeline
+    with osd_pipeline_lock:
+        if _osd_pipeline is None:
+            print("Loading overlapped speech detection pipeline...")
+            _osd_pipeline = OverlappedSpeechDetection(segmentation=segmentation_model)
+            # Fixed thresholds, applied once at construction — unlike the main diarization
+            # pipeline, OSD isn't re-instantiated per-request with caller-supplied values,
+            # so there's no cross-thread instantiate() race to guard against here.
+            _osd_pipeline.instantiate({
+                "min_duration_on": 0.0,
+                "min_duration_off": 0.0,
+            })
+            if torch.cuda.is_available():
+                _osd_pipeline.to(torch.device("cuda"))
+    return _osd_pipeline
+
+
+def get_overlap_regions(audio_input: dict) -> list:
+    """Run overlapped speech detection once for this file and return (start, end) regions
+    where two or more speakers are talking at once.
+
+    Takes the same pre-loaded {"waveform", "sample_rate"} dict the main diarization
+    pipeline uses (built by pad_audio/safe_load_audio) rather than a raw file path —
+    pyannote's Audio IO uses "waveform" directly when present, otherwise it falls back
+    to torchaudio.load() on the raw path with no format-conversion fallback, which
+    fails outright on containers like .webm that soundfile can't parse.
+    """
+    osd_pipeline = get_osd_pipeline()
+    osd_output = osd_pipeline(audio_input)
+    return [(seg.start, seg.end) for seg in osd_output.get_timeline().support()]
+
+
+def _word_in_overlap_region(word, overlap_regions: list) -> bool:
+    mid = (word.start + word.end) / 2
+    return any(start <= mid <= end for start, end in overlap_regions)
+
+
 class WhisperService:
     def __init__(self, settings: SettingsDep, file_service: Annotated[FileService, Depends(FileService)]):
         self.settings = settings
@@ -489,8 +532,13 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
     _beam_size = beam_size if beam_size is not None else 3
     _no_speech_threshold = no_speech_threshold if no_speech_threshold is not None else 0.3
     _initial_prompt = initial_prompt
-    _vad_filter = vad_filter if vad_filter is not None else False
-    _hallucination_silence_threshold = hallucination_silence_threshold
+    # VAD strips silence before it reaches the model, and hallucination_silence_threshold
+    # flags word-level probability anomalies surrounded by silence — together they catch
+    # the "confidently repeats a memorized phrase during silence" failure mode that
+    # no_speech_threshold alone misses (it gets overridden whenever the model is
+    # confident, which is exactly when a memorized hallucination occurs).
+    _vad_filter = vad_filter if vad_filter is not None else True
+    _hallucination_silence_threshold = hallucination_silence_threshold if hallucination_silence_threshold is not None else 2.0
 
     print("=" * 50)
     print("TRANSCRIPTION CONFIG")
@@ -533,17 +581,6 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
         print("CUDA NOT AVAILABLE, USING CPU for Diarization")
    
     diarization_pipeline = get_diarization_pipeline(hf_token)
-    diarization_pipeline.instantiate({
-        "segmentation": {
-            "min_duration_off": min_duration_off,
-        },
-        "clustering": {
-            "threshold": clustering_threshold,
-            "method": "centroid",
-            "min_cluster_size": min_cluster_size,
-        }
-    })
-
 
     result_segments = []
     for segment in segments:
@@ -554,7 +591,15 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
             'words': segment.words
         })
 
-    words_with_speakers = assign_word_speakers(file_path, result_segments, diarization_pipeline, num_of_speakers)
+    words_with_speakers = assign_word_speakers(
+        file_path,
+        result_segments,
+        diarization_pipeline,
+        clustering_threshold,
+        min_duration_off,
+        min_cluster_size,
+        num_of_speakers,
+    )
     speaker_turns = group_by_speaker_turns(words_with_speakers)
 
     if classify_events:
@@ -616,6 +661,16 @@ _BOUNDARY_ZONE_S = 0.15
 # of how many words they contain.
 _ISLAND_MAX_DURATION_S = 0.3
 
+# Short interjections/backchannels are prone to speaker mis-attribution regardless of how
+# confidently pyannote placed them — brief, acoustically close to whoever's speaking.
+# A run consisting entirely of these words is eligible for island collapse even when
+# confidently assigned. Best-effort starter list — extend based on [smoothing] log output.
+_BACKCHANNEL_WORDS = {
+    "yeah", "yes", "okay", "ok", "right", "mhm", "mm", "mm-hmm", "hmm",
+    "uh-huh", "huh", "yep", "sure",
+    "ja", "genau", "richtig",   # German — sample audio includes German speech
+}
+
 
 def _nearest_speaker_by_midpoint(start: float, end: float, tracks: list) -> Optional[str]:
     """Return the speaker whose segment midpoint is closest to the given time range."""
@@ -642,24 +697,52 @@ def _assign_word_speaker_by_overlap(word, tracks: list) -> Optional[str]:
     return best_speaker
 
 
-def _assign_word_speaker_by_midpoint(word, tracks: list) -> Optional[str]:
+def _assign_word_speaker_by_midpoint(word, tracks: list, overlap_regions: list) -> Tuple[Optional[str], str, bool]:
     """Assign speaker by word midpoint with a boundary-zone fallback.
 
-    For words whose midpoint sits well inside a diarization segment, midpoint
-    gives a clean unambiguous answer. For words within _BOUNDARY_ZONE_S of a
-    segment edge (where pyannote timing errors are most likely), we fall back
-    to overlap-based comparison which is more robust in that narrow window.
+    Returns (speaker, confidence, in_overlap). confidence is 'clean' (midpoint inside
+    exactly one segment, not near its edge), 'boundary' (near a segment edge, or midpoint
+    inside 2+ overlapping segments — pyannote turns can genuinely overlap during
+    cross-talk, or OSD confirms crosstalk here even with a single matching track), or
+    'fallback' (midpoint inside no segment at all). in_overlap is the OSD signal on its
+    own, independent of how the main diarization pipeline clustered its tracks.
     """
     mid = (word.start + word.end) / 2
+    in_overlap = _word_in_overlap_region(word, overlap_regions)
 
-    for turn, _, speaker in tracks:
-        if turn.start <= mid <= turn.end:
-            near_boundary = (mid - turn.start) < _BOUNDARY_ZONE_S or (turn.end - mid) < _BOUNDARY_ZONE_S
-            if near_boundary:
-                return _assign_word_speaker_by_overlap(word, tracks)
-            return speaker
+    # Gather every track containing the midpoint, not just the first — pyannote
+    # diarization turns can overlap, so stopping at the first hit silently discards
+    # competing candidate speakers.
+    containing = [
+        (turn, speaker) for turn, _, speaker in tracks
+        if turn.start <= mid <= turn.end
+    ]
 
-    return _nearest_speaker_by_midpoint(word.start, word.end, tracks)
+    if not containing:
+        return _nearest_speaker_by_midpoint(word.start, word.end, tracks), 'fallback', in_overlap
+
+    if len(containing) == 1:
+        turn, speaker = containing[0]
+        near_boundary = (mid - turn.start) < _BOUNDARY_ZONE_S or (turn.end - mid) < _BOUNDARY_ZONE_S
+        # OSD can flag genuine crosstalk even when the main diarization pipeline's
+        # clustering only surfaced a single track here — trust OSD over the single-track
+        # match and force the more careful overlap-based comparison rather than
+        # returning the track directly.
+        if near_boundary or in_overlap:
+            return _assign_word_speaker_by_overlap(word, tracks), 'boundary', in_overlap
+        return speaker, 'clean', in_overlap
+
+    # Multiple overlapping segments claim this midpoint — genuinely ambiguous.
+    return _assign_word_speaker_by_overlap(word, tracks), 'boundary', in_overlap
+
+
+def _is_backchannel_run(words: list, start_idx: int, end_idx: int) -> bool:
+    """True if every word in words[start_idx:end_idx] is a short backchannel/filler token."""
+    for w in words[start_idx:end_idx]:
+        cleaned = w['word'].strip().strip('.,!?').lower()
+        if cleaned not in _BACKCHANNEL_WORDS:
+            return False
+    return True
 
 
 def _smooth_speaker_assignments(words: list) -> list:
@@ -667,6 +750,10 @@ def _smooth_speaker_assignments(words: list) -> list:
 
     Uses total run duration rather than word count so that short bursts of multiple
     fast words (e.g. 'Ja, okay') are also caught. Iterates until stable.
+
+    A run is only collapsed if EITHER no word in it has 'clean' confidence (diarization
+    itself was never unambiguous about this being a real speaker change), OR the whole
+    run is a backchannel/filler phrase (prone to misattribution regardless of confidence).
     """
     if len(words) < 3:
         return words
@@ -685,16 +772,40 @@ def _smooth_speaker_assignments(words: list) -> list:
                 run_duration = words[j - 1]['end'] - words[i]['start']
                 prev_speaker = words[i - 1]['speaker']
                 next_speaker = words[j]['speaker']
-                if run_duration < _ISLAND_MAX_DURATION_S and prev_speaker == next_speaker and prev_speaker != current_speaker:
-                    for k in range(i, j):
-                        words[k] = {**words[k], 'speaker': prev_speaker}
-                    changed = True
+                is_short_island = run_duration < _ISLAND_MAX_DURATION_S
+                is_sandwiched = prev_speaker == next_speaker and prev_speaker != current_speaker
+
+                if is_short_island and is_sandwiched:
+                    run_is_confident = any(w['confidence'] == 'clean' for w in words[i:j])
+                    is_backchannel = _is_backchannel_run(words, i, j)
+                    run_is_overlap = any(w.get('in_overlap') for w in words[i:j])
+                    should_collapse = (not run_is_confident) and (not is_backchannel) and (not run_is_overlap)
+
+                    run_text = ' '.join(w['word'].strip() for w in words[i:j])
+                    print(
+                        f"[smoothing] run='{run_text}' duration={run_duration:.2f}s "
+                        f"confident={run_is_confident} backchannel={is_backchannel} overlap={run_is_overlap} "
+                        f"-> {'COLLAPSED to ' + str(prev_speaker) if should_collapse else 'preserved'}"
+                    )
+
+                    if should_collapse:
+                        for k in range(i, j):
+                            words[k] = {**words[k], 'speaker': prev_speaker}
+                        changed = True
             i = j
 
     return words
 
 
-def assign_word_speakers(audio_file_path: str, transcription_segments, diarization_pipeline: Pipeline, num_of_speakers: Optional[int] = None):
+def assign_word_speakers(
+    audio_file_path: str,
+    transcription_segments,
+    diarization_pipeline: Pipeline,
+    clustering_threshold: float,
+    min_duration_off: float,
+    min_cluster_size: int,
+    num_of_speakers: Optional[int] = None,
+):
     print("Diarizing audio...")
     diarization_kwargs = {}
 
@@ -705,7 +816,27 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
     # Pad audio file with empty audio after chunk split
     audio_input = pad_audio(audio_file_path)
 
-    diarization = diarization_pipeline(audio_input, **diarization_kwargs)
+    print("Detecting overlapped speech...")
+    overlap_regions = get_overlap_regions(audio_input)
+
+    # _diarization_pipeline is one shared, mutable Pipeline (get_diarization_pipeline).
+    # instantiate() mutates its config in place, so it must be immediately followed by
+    # the actual invocation under the SAME lock — otherwise thread A's instantiate()
+    # can be clobbered by thread B's instantiate() before A's diarization call runs,
+    # silently applying B's thresholds to A's audio.
+    with diarization_call_lock:
+        diarization_pipeline.instantiate({
+            "segmentation": {
+                "min_duration_off": min_duration_off,
+            },
+            "clustering": {
+                "threshold": clustering_threshold,
+                "method": "centroid",
+                "min_cluster_size": min_cluster_size,
+            }
+        })
+        diarization = diarization_pipeline(audio_input, **diarization_kwargs)
+
     tracks = list(diarization.itertracks(yield_label=True))
 
     words_with_speakers = []
@@ -715,10 +846,17 @@ def assign_word_speakers(audio_file_path: str, transcription_segments, diarizati
             continue
 
         for word in segment['words']:
-            assigned = _assign_word_speaker_by_midpoint(word, tracks)
+            assigned, confidence, in_overlap = _assign_word_speaker_by_midpoint(word, tracks, overlap_regions)
             if assigned is None:
                 print(f"WARNING: No speaker found for word '{word.word}' at {word.start:.2f}s-{word.end:.2f}s")
-            words_with_speakers.append({'word': word.word, 'start': word.start, 'end': word.end, 'speaker': assigned})
+            words_with_speakers.append({
+                'word': word.word,
+                'start': word.start,
+                'end': word.end,
+                'speaker': assigned,
+                'confidence': confidence,
+                'in_overlap': in_overlap,
+            })
 
     return _smooth_speaker_assignments(words_with_speakers)
 
