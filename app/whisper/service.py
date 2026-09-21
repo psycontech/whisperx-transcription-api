@@ -4,17 +4,20 @@ import torch
 import torchaudio # type: ignore
 import threading
 import os
+import multiprocessing
 from fastapi import Depends
 from asyncio import get_event_loop
-from pyannote.audio import Pipeline  # type: ignore
-from pyannote.audio.pipelines import OverlappedSpeechDetection  # type: ignore
+from pyannote.core import Segment  # type: ignore
 from datetime import datetime, timezone
-from settings.config import SettingsDep
+from settings.config import SettingsDep, settings
 from faster_whisper import WhisperModel # type: ignore
 from app.file.service import FileService
+from app.whisper.audio_utils import safe_load_audio
+from app.whisper.diarization_worker import diarize_in_subprocess
 from typing import Any, Annotated, Optional, Tuple
 from faster_whisper.transcribe import TranscriptionInfo # type: ignore
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures.process import BrokenProcessPool
 from transformers import ASTFeatureExtractor, AutoModelForAudioClassification  # type: ignore
 from .schemas.process_audio_schema import ProcessAudioSchema
 from .schemas.process_audio_response_schema import ProcessAudioResponseSchema, SpeakerTurn
@@ -26,16 +29,18 @@ _active_transcriptions_lock = threading.Lock()
 _active_transcriptions = 0
 
 _whisper_model: Optional[WhisperModel] = None
-_diarization_pipeline: Optional[Pipeline] = None
-_osd_pipeline: Optional[OverlappedSpeechDetection] = None
 _ast_model = None
 _ast_feature_extractor = None
 
 whisper_model_lock = threading.Lock()
-diarization_pipeline_lock = threading.Lock()
-diarization_call_lock = threading.Lock()
-osd_pipeline_lock = threading.Lock()
 _ast_lock = threading.Lock()
+
+# Diarization runs in a dedicated single-worker subprocess (not the shared
+# ThreadPoolExecutor above) so a GPU-level hang can be recovered from by killing
+# the process — something impossible for a stuck OS thread. See
+# run_diarization_in_subprocess and app/whisper/diarization_worker.py.
+_diarization_pool_lock = threading.Lock()
+_diarization_process_pool: Optional[ProcessPoolExecutor] = None
 
 AST_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
 AST_CONFIDENCE_THRESHOLD = 0.1
@@ -371,56 +376,135 @@ def embed_events_in_text(audio_file_path: str, start: float, end: float, words: 
     return "".join(tokens).strip()
 
 
-def get_diarization_pipeline(hf_token: str) -> Pipeline:
-    global _diarization_pipeline
-    with diarization_pipeline_lock:
-        if _diarization_pipeline is None:
-            print("Loading diarization pipeline...")
-            _diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token
-            )
-            if torch.cuda.is_available():
-                _diarization_pipeline.to(torch.device("cuda"))
-    return _diarization_pipeline
-
-
-def get_osd_pipeline(segmentation_model: str = "pyannote/segmentation-3.0") -> OverlappedSpeechDetection:
-    global _osd_pipeline
-    with osd_pipeline_lock:
-        if _osd_pipeline is None:
-            print("Loading overlapped speech detection pipeline...")
-            _osd_pipeline = OverlappedSpeechDetection(segmentation=segmentation_model)
-            # Fixed thresholds, applied once at construction — unlike the main diarization
-            # pipeline, OSD isn't re-instantiated per-request with caller-supplied values,
-            # so there's no cross-thread instantiate() race to guard against here.
-            _osd_pipeline.instantiate({
-                "min_duration_on": 0.0,
-                "min_duration_off": 0.0,
-            })
-            if torch.cuda.is_available():
-                _osd_pipeline.to(torch.device("cuda"))
-    return _osd_pipeline
-
-
-def get_overlap_regions(audio_input: dict) -> list:
-    """Run overlapped speech detection once for this file and return (start, end) regions
-    where two or more speakers are talking at once.
-
-    Takes the same pre-loaded {"waveform", "sample_rate"} dict the main diarization
-    pipeline uses (built by pad_audio/safe_load_audio) rather than a raw file path —
-    pyannote's Audio IO uses "waveform" directly when present, otherwise it falls back
-    to torchaudio.load() on the raw path with no format-conversion fallback, which
-    fails outright on containers like .webm that soundfile can't parse.
-    """
-    osd_pipeline = get_osd_pipeline()
-    osd_output = osd_pipeline(audio_input)
-    return [(seg.start, seg.end) for seg in osd_output.get_timeline().support()]
-
-
 def _word_in_overlap_region(word, overlap_regions: list) -> bool:
     mid = (word.start + word.end) / 2
     return any(start <= mid <= end for start, end in overlap_regions)
+
+
+def compute_diarization_timeout(audio_duration_seconds: float) -> float:
+    """How long to wait for the diarization subprocess before treating it as hung
+    and killing it. Must scale with audio duration — diarization time scales with
+    it too, and a flat timeout would kill legitimately slow long files.
+
+    DIARIZATION_WORST_CASE_RATIO is an unverified placeholder (see settings/config.py)
+    until tuned against real production throughput numbers.
+    """
+    worst_case_ratio = settings.DIARIZATION_WORST_CASE_RATIO
+    safety_multiplier = settings.DIARIZATION_TIMEOUT_SAFETY_MULTIPLIER
+    min_timeout_s = settings.DIARIZATION_MIN_TIMEOUT_S
+    max_timeout_s = settings.DIARIZATION_MAX_TIMEOUT_S
+
+    estimated = (audio_duration_seconds / worst_case_ratio) * safety_multiplier
+    return max(min_timeout_s, min(estimated, max_timeout_s))
+
+
+def _kill_diarization_pool(pool: ProcessPoolExecutor) -> None:
+    """ProcessPoolExecutor.shutdown() — even with cancel_futures=True — does NOT
+    terminate a worker that is currently executing a task; cancel_futures only
+    drops queued-but-not-yet-started work. A genuinely hung worker (the entire
+    reason this pool exists) keeps running forever after shutdown() returns,
+    verified empirically: shutdown() alone leaves the busy child process alive.
+
+    There is no public API for killing a running task, so this reaches into the
+    executor's _processes dict (pid -> multiprocessing.Process) to kill(9) it
+    directly. _processes is a PRIVATE, undocumented CPython attribute — verified
+    against Python 3.12 (this project's pinned version) — with no stability
+    guarantee across versions. If a Python upgrade ever removes/renames it, fail
+    loudly here rather than silently falling back to the broken shutdown()-only
+    behavior this function exists to avoid.
+    """
+    processes = getattr(pool, "_processes", None)
+    if processes is None:
+        print(
+            "[diarization-pool] WARNING: ProcessPoolExecutor._processes is unavailable on "
+            "this Python version — cannot forcibly kill the stuck worker process. GPU "
+            "memory will leak until it exits on its own. This helper needs updating for "
+            "the current Python version."
+        )
+    else:
+        for process in processes.values():
+            if process.is_alive():
+                print(f"[diarization-pool] killing worker process pid={process.pid}")
+                process.kill()
+                # kill() only sends SIGKILL — it does not block until the OS has actually
+                # reaped the process, verified empirically (is_alive() can still read True
+                # immediately after kill() returns). Join with a bound so a subsequent
+                # respawn doesn't start allocating GPU memory before the killed process's
+                # CUDA context has actually been torn down by the driver.
+                process.join(timeout=10)
+                if process.is_alive():
+                    print(
+                        f"[diarization-pool] WARNING: pid={process.pid} still alive "
+                        f"{10}s after kill() — proceeding anyway, but its GPU memory may "
+                        f"not be reclaimed yet"
+                    )
+
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _spawn_diarization_pool() -> ProcessPoolExecutor:
+    # "spawn" is required, not just the safer default: this process's other threads
+    # (whisper/AST models) may already hold an initialized CUDA context by the time
+    # this pool is created, and forking a process with an active CUDA context produces
+    # a broken child — the exact kind of GPU-level corruption this isolation is meant
+    # to make recoverable from, not reintroduce.
+    print("[diarization-pool] spawning dedicated ProcessPoolExecutor(max_workers=1, spawn context)")
+    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+
+
+def run_diarization_in_subprocess(
+    audio_file_path: str,
+    hf_token: str,
+    clustering_threshold: float,
+    min_duration_off: float,
+    min_cluster_size: int,
+    num_of_speakers: Optional[int],
+    timeout_s: float,
+) -> dict:
+    """Runs diarization + overlapped-speech-detection in the dedicated subprocess pool,
+    killing and respawning it if the call hangs or the worker process dies.
+
+    Held for the full submit+wait (up to timeout_s, which can be up to
+    DIARIZATION_MAX_TIMEOUT_S): this matches today's existing behavior, where
+    diarization calls are already fully serialized one-at-a-time — a second caller
+    blocking on this lock is not a regression, and it also means a respawn can never
+    race with another thread's in-flight submit.
+    """
+    global _diarization_process_pool
+    with _diarization_pool_lock:
+        if _diarization_process_pool is None:
+            _diarization_process_pool = _spawn_diarization_pool()
+        pool = _diarization_process_pool
+
+        print(f"[diarization-pool] dispatching job (timeout={timeout_s:.0f}s) file={audio_file_path}")
+        future = pool.submit(
+            diarize_in_subprocess,
+            audio_file_path,
+            hf_token,
+            clustering_threshold,
+            min_duration_off,
+            min_cluster_size,
+            num_of_speakers,
+        )
+        try:
+            result = future.result(timeout=timeout_s)
+        except FutureTimeoutError:
+            print(f"[diarization-pool] TIMEOUT after {timeout_s:.0f}s — killing stuck worker process and respawning")
+            _kill_diarization_pool(pool)
+            _diarization_process_pool = _spawn_diarization_pool()
+            raise RuntimeError(
+                f"Diarization timed out after {timeout_s:.0f}s; worker process was killed and respawned"
+            ) from None
+        except BrokenProcessPool as e:
+            # The worker already died on its own here (crash/OOM-kill/etc.), so there's
+            # nothing left to kill — just discard the dead pool object and respawn.
+            print(f"[diarization-pool] worker process crashed ({e!r}) — respawning")
+            pool.shutdown(wait=False, cancel_futures=True)
+            _diarization_process_pool = _spawn_diarization_pool()
+            raise RuntimeError("Diarization worker process crashed") from e
+
+    print(f"[diarization-pool] job completed: {len(result['tracks'])} tracks, {len(result['overlap_regions'])} overlap regions")
+    return result
 
 
 class WhisperService:
@@ -572,16 +656,6 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
         condition_on_previous_text=False,
     )
 
-    print("Loading diarization model...")
-
-
-    if torch.cuda.is_available():
-        print("CUDA IS AVAILABLE")
-    else:
-        print("CUDA NOT AVAILABLE, USING CPU for Diarization")
-   
-    diarization_pipeline = get_diarization_pipeline(hf_token)
-
     result_segments = []
     for segment in segments:
         result_segments.append({
@@ -594,10 +668,11 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
     words_with_speakers = assign_word_speakers(
         file_path,
         result_segments,
-        diarization_pipeline,
+        hf_token,
         clustering_threshold,
         min_duration_off,
         min_cluster_size,
+        info.duration,
         num_of_speakers,
     )
     speaker_turns = group_by_speaker_turns(words_with_speakers)
@@ -622,34 +697,6 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
             turn["text_with_events"] = None
 
     return speaker_turns, info
-
-
-def safe_load_audio(audio_file_path: str):
-    import os
-    tmp_wav_path = None
-    try:
-        return torchaudio.load(str(audio_file_path))
-    except RuntimeError:
-        from pydub import AudioSegment
-        tmp_wav_path = str(audio_file_path) + "_converted.wav"
-        AudioSegment.from_file(audio_file_path).export(tmp_wav_path, format="wav")
-        waveform, sample_rate = torchaudio.load(tmp_wav_path)
-        return waveform, sample_rate
-    finally:
-        if tmp_wav_path and os.path.exists(tmp_wav_path):
-            os.remove(tmp_wav_path)
-
-
-def pad_audio(audio_file_path: str) -> dict:
-    waveform, sample_rate = safe_load_audio(audio_file_path)
-
-    chunk_size = 160000
-    remainder = waveform.shape[-1] % chunk_size
-    if remainder != 0:
-        pad_size = chunk_size - remainder
-        waveform = torch.nn.functional.pad(waveform, (0, pad_size))
-
-    return {"waveform": waveform, "sample_rate": sample_rate}
 
 
 # Within this distance (seconds) of a diarization segment boundary, midpoint assignment
@@ -800,44 +847,34 @@ def _smooth_speaker_assignments(words: list) -> list:
 def assign_word_speakers(
     audio_file_path: str,
     transcription_segments,
-    diarization_pipeline: Pipeline,
+    hf_token: str,
     clustering_threshold: float,
     min_duration_off: float,
     min_cluster_size: int,
+    audio_duration_seconds: float,
     num_of_speakers: Optional[int] = None,
 ):
     print("Diarizing audio...")
-    diarization_kwargs = {}
 
-    if num_of_speakers:
-        diarization_kwargs["min_speakers"] = num_of_speakers
-        diarization_kwargs["max_speakers"] = num_of_speakers
-
-    # Pad audio file with empty audio after chunk split
-    audio_input = pad_audio(audio_file_path)
-
-    print("Detecting overlapped speech...")
-    overlap_regions = get_overlap_regions(audio_input)
-
-    # _diarization_pipeline is one shared, mutable Pipeline (get_diarization_pipeline).
-    # instantiate() mutates its config in place, so it must be immediately followed by
-    # the actual invocation under the SAME lock — otherwise thread A's instantiate()
-    # can be clobbered by thread B's instantiate() before A's diarization call runs,
-    # silently applying B's thresholds to A's audio.
-    with diarization_call_lock:
-        diarization_pipeline.instantiate({
-            "segmentation": {
-                "min_duration_off": min_duration_off,
-            },
-            "clustering": {
-                "threshold": clustering_threshold,
-                "method": "centroid",
-                "min_cluster_size": min_cluster_size,
-            }
-        })
-        diarization = diarization_pipeline(audio_input, **diarization_kwargs)
-
-    tracks = list(diarization.itertracks(yield_label=True))
+    timeout_s = compute_diarization_timeout(audio_duration_seconds)
+    result = run_diarization_in_subprocess(
+        audio_file_path,
+        hf_token,
+        clustering_threshold,
+        min_duration_off,
+        min_cluster_size,
+        num_of_speakers,
+        timeout_s,
+    )
+    # The subprocess returns plain (start, end, speaker) tuples — reconstruct the
+    # (Segment, track_name, speaker) shape the assignment functions below expect,
+    # matching what diarization.itertracks(yield_label=True) used to hand them
+    # directly before diarization moved out-of-process.
+    tracks = [
+        (Segment(start, end), None, speaker)
+        for start, end, speaker in result["tracks"]
+    ]
+    overlap_regions = result["overlap_regions"]
 
     words_with_speakers = []
 

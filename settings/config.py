@@ -54,6 +54,18 @@ class GlobalConfig(BaseSettings):
     DIARIZATION_MIN_DURATION_OFF: float = Field(0.1, env="DIARIZATION_MIN_DURATION_OFF") # type: ignore
     DIARIZATION_MIN_CLUSTER_SIZE: int = Field(12, env="DIARIZATION_MIN_CLUSTER_SIZE") # type: ignore
 
+    # Diarization subprocess timeout tuning (kills+respawns the diarization worker
+    # process if it hangs — see run_diarization_in_subprocess in app/whisper/service.py).
+    # TODO(wisdom): DIARIZATION_WORST_CASE_RATIO is an UNVERIFIED PLACEHOLDER (1.0 = the
+    # pipeline processes audio at real-time speed in the worst observed case). This has
+    # NOT been measured against production throughput/latency logs. Tune it once you
+    # have real worst-case numbers — a wrong value either times out legitimately slow
+    # long files, or waits too long to recover from a genuine hang.
+    DIARIZATION_WORST_CASE_RATIO: float = Field(1.0, env="DIARIZATION_WORST_CASE_RATIO") # type: ignore
+    DIARIZATION_TIMEOUT_SAFETY_MULTIPLIER: float = Field(2.0, env="DIARIZATION_TIMEOUT_SAFETY_MULTIPLIER") # type: ignore
+    DIARIZATION_MIN_TIMEOUT_S: float = Field(300.0, env="DIARIZATION_MIN_TIMEOUT_S") # type: ignore
+    DIARIZATION_MAX_TIMEOUT_S: float = Field(3600.0, env="DIARIZATION_MAX_TIMEOUT_S") # type: ignore
+
     # Paths (computed from BASE_DIR at init)
     UPLOAD_DIR: Path = Field(default=_BASE_DIR / "uploads")
 
