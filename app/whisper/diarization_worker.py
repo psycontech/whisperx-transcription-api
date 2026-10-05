@@ -93,6 +93,11 @@ def diarize_in_subprocess(
     reconstructs whatever shape it needs from these.
     """
     audio_input = pad_audio(audio_file_path)
+    decoded_duration = audio_input["waveform"].shape[-1] / audio_input["sample_rate"]
+    print(
+        f"[diarization-worker] decoded audio: shape={tuple(audio_input['waveform'].shape)} "
+        f"sample_rate={audio_input['sample_rate']} duration={decoded_duration:.2f}s"
+    )
 
     print("[diarization-worker] running overlapped speech detection...")
     overlap_regions = get_overlap_regions(audio_input)
