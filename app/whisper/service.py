@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from settings.config import SettingsDep, settings
 from faster_whisper import WhisperModel # type: ignore
 from app.file.service import FileService
-from app.whisper.audio_utils import safe_load_audio
+from app.whisper.audio_utils import safe_load_audio, load_audio_for_whisper
 from app.whisper.diarization_worker import diarize_in_subprocess
 from typing import Any, Annotated, Optional, Tuple
 from faster_whisper.transcribe import TranscriptionInfo # type: ignore
@@ -643,8 +643,9 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
     print("=" * 50)
 
     print("Transcribing...")
+    audio_array = load_audio_for_whisper(file_path, whisper_model.feature_extractor.sampling_rate)
     segments, info = whisper_model.transcribe(
-        file_path,
+        audio_array,
         beam_size=_beam_size,
         word_timestamps=True,
         language=language,

@@ -76,3 +76,27 @@ def pad_audio(audio_file_path: str) -> dict:
         waveform = torch.nn.functional.pad(waveform, (0, pad_size))
 
     return {"waveform": waveform, "sample_rate": sample_rate}
+
+
+def load_audio_for_whisper(audio_file_path: str, sampling_rate: int):
+    """Decode audio via safe_load_audio and return a mono float32 numpy array at
+    sampling_rate — the same shape faster-whisper's own decode_audio() produces.
+
+    faster-whisper decodes audio itself via PyAV, bypassed entirely by passing a
+    numpy array into WhisperModel.transcribe() instead of a file path. This matters
+    because PyAV has shown the exact same silent-truncation failure mode as
+    torchaudio for at least one real MP3 (confirmed directly: faster_whisper.audio.
+    decode_audio() returned 0.08s of a 297s recording, with no exception, same file
+    where torchaudio.load() also silently truncated). Whisper should go through our
+    one reliable loader instead of trusting either decoder's own file handling.
+    """
+    import numpy as np
+
+    waveform, sample_rate = safe_load_audio(audio_file_path)
+    mono = waveform.mean(dim=0)
+
+    if sample_rate != sampling_rate:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=sampling_rate)
+        mono = resampler(mono.unsqueeze(0)).squeeze(0)
+
+    return mono.numpy().astype(np.float32)
