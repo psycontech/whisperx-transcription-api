@@ -677,6 +677,11 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
     )
     speaker_turns = group_by_speaker_turns(words_with_speakers)
 
+    print(f"[transcribe_audio] {len(speaker_turns)} speaker turn(s) produced")
+    for i, turn in enumerate(speaker_turns[:5]):
+        preview = turn["text"][:80].replace("\n", " ")
+        print(f"  turn {i + 1}: speaker={turn['speaker']} [{turn['start']:.2f}s-{turn['end']:.2f}s] text='{preview}'")
+
     if classify_events:
         print(f"Classifying audio events for {len(speaker_turns)} turns...")
         for i, turn in enumerate(speaker_turns):
