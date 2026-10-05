@@ -665,6 +665,11 @@ def transcribe_audio(file_path: str, model_size_or_path: str, device: str, compu
             'words': segment.words
         })
 
+    print(
+        f"[transcribe_audio] {len(result_segments)} whisper segment(s), "
+        f"duration={info.duration:.2f}s duration_after_vad={info.duration_after_vad:.2f}s"
+    )
+
     words_with_speakers = assign_word_speakers(
         file_path,
         result_segments,
